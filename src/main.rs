@@ -22,7 +22,7 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, Sel};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSRunningApplication, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSRunningApplication, NSStatusBar, NSWorkspace, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSString, NSTimer};
 
@@ -81,6 +81,18 @@ struct State {
     hk_handle: Cell<Option<HotkeyHandle>>,
     icons: RefCell<HashMap<i32, Retained<NSImage>>>,
     menu: RefCell<Option<MenuParts>>,
+    install_failed_logged: Cell<bool>,
+}
+
+/// `WinInfo` holds an `AXUIElement`, which is not marked `Send` by the bindings; AX elements
+/// are CF objects that may be used from any thread (the AX API is thread-safe).
+struct SendWin(WinInfo);
+// SAFETY: see above; the value is moved to exactly one other thread and used only there.
+unsafe impl Send for SendWin {}
+impl SendWin {
+    fn into_inner(self) -> WinInfo {
+        self.0
+    }
 }
 
 thread_local! {
@@ -113,8 +125,14 @@ impl State {
         self.generation.set(gen_);
 
         let mut list = windows::list_windows();
+        // Evict thumbnails / icons of windows and apps that are gone (computed before the
+        // same-app filter so Option+` doesn't drop other apps' cached thumbnails).
+        let live: Vec<u32> = list.iter().map(|w| w.wid).collect();
+        self.thumbs.retain_only(&live);
+        self.icons.borrow_mut().retain(|pid, _| list.iter().any(|w| w.pid == *pid));
+
+        let front_pid = NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier());
         if same_app {
-            let front_pid = list.iter().min_by_key(|w| w.z_index).map(|w| w.pid);
             list.retain(|w| Some(w.pid) == front_pid);
         }
         if list.is_empty() {
@@ -122,14 +140,27 @@ impl State {
             return false;
         }
 
-        // Initial selection follows most-recently-used order (z order), wherever that window
-        // landed in the app-grouped list: Option+Tab => previous window, Shift => least recent.
+        // The window the user is in right now: the focused window if AX reports one in the
+        // list, else the frontmost app's topmost window when that is also the topmost overall.
+        // If the active app has no window on top (last window closed / minimized, desktop
+        // clicked), there is no current window and the topmost listed window is the target.
         let mut by_z: Vec<usize> = (0..list.len()).collect();
         by_z.sort_by_key(|&i| list[i].z_index);
+        let focused = windows::focused_window_id();
+        let current = focused
+            .and_then(|wid| list.iter().position(|w| w.wid == wid))
+            .or_else(|| (Some(list[by_z[0]].pid) == front_pid && list[by_z[0]].on_current_space).then_some(by_z[0]));
+        // Most-recently-used order: current window first, then z order.
+        if let Some(c) = current {
+            by_z.retain(|&i| i != c);
+            by_z.insert(0, c);
+        }
         let sel = if reverse {
             *by_z.last().unwrap()
-        } else {
+        } else if current.is_some() {
             by_z.get(1).copied().unwrap_or(by_z[0])
+        } else {
+            by_z[0]
         };
 
         let mut group = 0usize;
@@ -153,15 +184,16 @@ impl State {
         // Fresh thumbnails: selected first, then the rest in display order.
         let mut wids: Vec<u32> = vec![list[sel].wid];
         wids.extend(list.iter().filter(|w| w.wid != list[sel].wid).map(|w| w.wid));
-        let live: Vec<u32> = list.iter().map(|w| w.wid).collect();
-        self.thumbs.retain_only(&live);
         self.thumbs.capture(wids, THUMB_MAX_W, THUMB_MAX_H, gen_, |g, wid, img| {
             if let Some(st) = state() {
                 st.on_thumbnail(g, wid, img);
             }
         });
 
-        log(&format!("open: {} windows, selected {sel} (reverse={reverse}, same_app={same_app})", list.len()));
+        log(&format!(
+            "open: {} windows, current={current:?} selected={sel} (reverse={reverse}, same_app={same_app})",
+            list.len()
+        ));
         *self.wins.borrow_mut() = list;
         *self.pending_tiles.borrow_mut() = Some(tiles);
         self.selected.set(sel);
@@ -185,6 +217,19 @@ impl State {
         }
         if let Some(tiles) = self.pending_tiles.borrow_mut().take() {
             self.switcher.show(tiles, self.selected.get());
+            // Panel frame in CG (top-left origin) coordinates, for diagnostics / e2e tests.
+            let f = self.switcher.panel().frame();
+            let primary_h = objc2_app_kit::NSScreen::screens(self.mtm)
+                .firstObject()
+                .map(|s| s.frame().size.height)
+                .unwrap_or(0.0);
+            log(&format!(
+                "panel shown: cg_frame={} {} {} {}",
+                f.origin.x,
+                primary_h - f.origin.y - f.size.height,
+                f.size.width,
+                f.size.height
+            ));
         }
     }
 
@@ -235,6 +280,9 @@ impl State {
         self.active.set(false);
         self.generation.set(self.generation.get() + 1);
         self.pending_tiles.borrow_mut().take();
+        if self.switcher.is_visible() {
+            log("panel hidden");
+        }
         self.switcher.hide();
     }
 
@@ -245,17 +293,15 @@ impl State {
         let idx = self.selected.get();
         self.end_session();
         let gen_ = self.generation.get();
-        // Focus outside the event-tap callback so the tap returns immediately.
-        DispatchQueue::main().exec_async(move || {
-            let Some(st) = state() else { return };
-            if st.generation.get() != gen_ {
-                return; // a new session started meanwhile
-            }
-            let wins = st.wins.borrow();
-            if let Some(w) = wins.get(idx) {
-                let ok = windows::focus_window(w);
-                log(&format!("commit: wid={} app={} title={:?} ok={ok}", w.wid, w.app_name, w.title));
-            }
+        let _ = gen_;
+        let Some(w) = self.wins.borrow().get(idx).cloned() else { return };
+        // Focusing talks to the target app over AX (it can block up to the AX timeout), so it
+        // runs off the main thread: the main run loop also services the keyboard event tap.
+        let w = SendWin(w);
+        let _ = std::thread::Builder::new().name("ztab-focus".into()).spawn(move || {
+            let w = w.into_inner();
+            let ok = windows::focus_window(&w);
+            log(&format!("commit: wid={} app={} title={:?} ok={ok}", w.wid, w.app_name, w.title));
         });
     }
 
@@ -319,7 +365,11 @@ impl State {
                 *self.hotkey.borrow_mut() = Some(hk);
                 self.refresh_menu();
             }
-            Err(e) => log(&format!("hotkey install failed: {e}")),
+            Err(e) => {
+                if !self.install_failed_logged.replace(true) {
+                    log(&format!("hotkey install failed: {e}"));
+                }
+            }
         }
     }
 
@@ -516,6 +566,7 @@ fn make_state(mtm: MainThreadMarker) -> Rc<State> {
         hk_handle: Cell::new(None),
         icons: RefCell::new(HashMap::new()),
         menu: RefCell::new(None),
+        install_failed_logged: Cell::new(false),
     });
     STATE.with(|s| {
         let _ = s.set(st.clone());
@@ -620,6 +671,5 @@ fn main() {
     });
     let _timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.5, true, &watchdog) };
 
-    let _ = st.mtm;
     app.run();
 }

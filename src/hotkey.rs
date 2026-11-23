@@ -368,6 +368,9 @@ impl Hotkey {
             }
         }
         let Some((tap, location)) = created else {
+            // No tap references `shared`, so it can be reclaimed (avoids a leak per retry).
+            // SAFETY: `shared` came from Box::leak above and nothing else holds it.
+            drop(unsafe { Box::from_raw(shared as *const Shared as *mut Shared) });
             return Err(ACCESSIBILITY_HINT.to_string());
         };
 

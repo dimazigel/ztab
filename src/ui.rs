@@ -82,7 +82,7 @@ pub const SMALL_ICON: f64 = 18.0;
 /// Preferred thumbnail height.
 pub const BASE_THUMB_H: f64 = 140.0;
 /// Smallest thumbnail height we shrink to before giving up on fitting vertically.
-pub const MIN_THUMB_H: f64 = 44.0;
+pub const MIN_THUMB_H: f64 = 26.0;
 /// Thumbnail width clamp, as a multiple of thumbnail height.
 pub const MIN_ASPECT: f64 = 1.0;
 pub const MAX_ASPECT: f64 = 1.78;
