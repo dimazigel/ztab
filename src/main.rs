@@ -82,6 +82,8 @@ struct State {
     icons: RefCell<HashMap<i32, Retained<NSImage>>>,
     menu: RefCell<Option<MenuParts>>,
     install_failed_logged: Cell<bool>,
+    /// The window ZTab switched to most recently.
+    last_focused: Cell<Option<u32>>,
 }
 
 /// `WinInfo` holds an `AXUIElement`, which is not marked `Send` by the bindings; AX elements
@@ -147,9 +149,16 @@ impl State {
         let mut by_z: Vec<usize> = (0..list.len()).collect();
         by_z.sort_by_key(|&i| list[i].z_index);
         let focused = windows::focused_window_id();
+        let top = &list[by_z[0]];
         let current = focused
             .and_then(|wid| list.iter().position(|w| w.wid == wid))
-            .or_else(|| (Some(list[by_z[0]].pid) == front_pid && list[by_z[0]].on_current_space).then_some(by_z[0]));
+            .or_else(|| {
+                // AX focus queries fail for some apps (Chrome, Electron). Fall back to the
+                // topmost window when it belongs to the frontmost app or is the window ZTab
+                // itself focused last.
+                let is_front = Some(top.pid) == front_pid || Some(top.wid) == self.last_focused.get();
+                (is_front && top.on_current_space && !top.minimized).then_some(by_z[0])
+            });
         // Most-recently-used order: current window first, then z order.
         if let Some(c) = current {
             by_z.retain(|&i| i != c);
@@ -191,8 +200,11 @@ impl State {
         });
 
         log(&format!(
-            "open: {} windows, current={current:?} selected={sel} (reverse={reverse}, same_app={same_app})",
-            list.len()
+            "open: {} windows, current={current:?} selected={sel} (reverse={reverse}, same_app={same_app}) \
+             focused={focused:?} front_pid={front_pid:?} top={}/{}",
+            list.len(),
+            top.wid,
+            top.pid
         ));
         *self.wins.borrow_mut() = list;
         *self.pending_tiles.borrow_mut() = Some(tiles);
@@ -295,6 +307,7 @@ impl State {
         let gen_ = self.generation.get();
         let _ = gen_;
         let Some(w) = self.wins.borrow().get(idx).cloned() else { return };
+        self.last_focused.set(Some(w.wid));
         // Focusing talks to the target app over AX (it can block up to the AX timeout), so it
         // runs off the main thread: the main run loop also services the keyboard event tap.
         let w = SendWin(w);
@@ -567,6 +580,7 @@ fn make_state(mtm: MainThreadMarker) -> Rc<State> {
         icons: RefCell::new(HashMap::new()),
         menu: RefCell::new(None),
         install_failed_logged: Cell::new(false),
+        last_focused: Cell::new(None),
     });
     STATE.with(|s| {
         let _ = s.set(st.clone());
