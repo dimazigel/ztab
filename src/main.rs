@@ -46,8 +46,14 @@ unsafe extern "C" {
 // Logging
 // ---------------------------------------------------------------------------------------------
 
+/// When the log reaches this size it is moved to `ztab.log.1` (replacing the previous one).
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 fn log(msg: &str) {
     let path = std::env::var("HOME").unwrap_or_default() + "/Library/Logs/ztab.log";
+    if std::fs::metadata(&path).map(|m| m.len() >= LOG_MAX_BYTES).unwrap_or(false) {
+        let _ = std::fs::rename(&path, format!("{path}.1"));
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

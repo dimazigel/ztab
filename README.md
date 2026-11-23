@@ -82,7 +82,7 @@ confusing.
 
 | What | Where / how |
 |---|---|
-| Log | `~/Library/Logs/ztab.log` |
+| Log | `~/Library/Logs/ztab.log`, rotated to `ztab.log.1` at 1 MB (at most ~2 MB kept) |
 | Dump the window list | `dist/ZTab.app/Contents/MacOS/ztab --dump-windows /tmp/w.txt` |
 | Render the switcher to a PNG | `open -W -n dist/ZTab.app --args --snapshot /tmp/s.png` |
 | End-to-end tests | Synthetic HID key and mouse events against a running ZTab. Bundle each one with `scripts/bundle.sh <bin> dist/<bin>/ZTab.app` and run it with `open -W -n -g dist/<bin>/ZTab.app --args <out.txt> …`. Needs an unlocked screen. |
