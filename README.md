@@ -25,6 +25,7 @@ scripts/install.sh           # build, copy to ~/Applications/ZTab.app, launch
 scripts/install.sh --login   # same, and also start ZTab at login (LaunchAgent)
 scripts/uninstall.sh         # stop and remove it
 scripts/bundle.sh            # just build dist/ZTab.app
+scripts/make-icon.sh         # regenerate packaging/AppIcon.icns from scripts/make-icon.swift
 ```
 
 **First launch: grant ZTab two permissions** in *System Settings → Privacy & Security*:
