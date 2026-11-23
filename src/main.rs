@@ -123,6 +123,7 @@ impl State {
 
     /// Start a switcher session. Returns false if there is nothing to show.
     fn open(&self, reverse: bool, same_app: bool) -> bool {
+        let t0 = std::time::Instant::now();
         let gen_ = self.generation.get() + 1;
         self.generation.set(gen_);
 
@@ -148,8 +149,13 @@ impl State {
         // clicked), there is no current window and the topmost listed window is the target.
         let mut by_z: Vec<usize> = (0..list.len()).collect();
         by_z.sort_by_key(|&i| list[i].z_index);
-        let focused = windows::focused_window_id();
         let top = &list[by_z[0]];
+        let t_list = t0.elapsed().as_secs_f64() * 1000.0;
+        // Ask AX for the focused window only when the cheap signal is ambiguous: the topmost
+        // window belongs to the frontmost app => it's the current one. (The AX query can block
+        // for the messaging timeout on busy apps, and this runs inside the event-tap callback.)
+        let cheap = Some(top.pid) == front_pid && top.on_current_space && !top.minimized;
+        let focused = if cheap { None } else { windows::focused_window_id() };
         let current = focused
             .and_then(|wid| list.iter().position(|w| w.wid == wid))
             .or_else(|| {
@@ -201,10 +207,11 @@ impl State {
 
         log(&format!(
             "open: {} windows, current={current:?} selected={sel} (reverse={reverse}, same_app={same_app}) \
-             focused={focused:?} front_pid={front_pid:?} top={}/{}",
+             focused={focused:?} front_pid={front_pid:?} top={}/{} list_ms={t_list:.1} total_ms={:.1}",
             list.len(),
             top.wid,
-            top.pid
+            top.pid,
+            t0.elapsed().as_secs_f64() * 1000.0
         ));
         *self.wins.borrow_mut() = list;
         *self.pending_tiles.borrow_mut() = Some(tiles);
@@ -235,12 +242,24 @@ impl State {
                 .firstObject()
                 .map(|s| s.frame().size.height)
                 .unwrap_or(0.0);
+            let (px, py) = (f.origin.x, primary_h - f.origin.y - f.size.height);
+            let centers: Vec<String> = {
+                let wins = self.wins.borrow();
+                self.switcher
+                    .layout()
+                    .tiles
+                    .iter()
+                    .zip(wins.iter())
+                    .map(|(r, w)| format!("{}:{:.0},{:.0}", w.wid, px + r.cx(), py + r.cy()))
+                    .collect()
+            };
             log(&format!(
-                "panel shown: cg_frame={} {} {} {}",
-                f.origin.x,
-                primary_h - f.origin.y - f.size.height,
+                "panel shown: cg_frame={} {} {} {} tiles={}",
+                px,
+                py,
                 f.size.width,
-                f.size.height
+                f.size.height,
+                centers.join(";")
             ));
         }
     }

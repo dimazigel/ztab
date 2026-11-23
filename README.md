@@ -10,6 +10,8 @@ It switches between *windows*, not apps.
   - **Mouse**: while holding ⌥, hover a tile to select it and click it to switch immediately.
   - **Esc** cancels. **Return** also switches.
 - **⌥ `** (backtick): the same switcher, limited to the current app's windows.
+- **Multiple displays**: the switcher opens on the screen under the mouse and lists windows from
+  every display.
 - **Menu-bar icon** (two overlapping rectangles): shows permission status and has **Quit ZTab**.
 - **What gets switched to**: minimized windows are restored and hidden apps are unhidden.
   Windows on other Spaces are listed on a best-effort basis.
@@ -83,7 +85,10 @@ confusing.
 | Log | `~/Library/Logs/ztab.log` |
 | Dump the window list | `dist/ZTab.app/Contents/MacOS/ztab --dump-windows /tmp/w.txt` |
 | Render the switcher to a PNG | `open -W -n dist/ZTab.app --args --snapshot /tmp/s.png` |
-| End-to-end test | Synthetic key and mouse events against a running ZTab: `scripts/bundle.sh e2e dist/e2e/ZTab.app && open -W -n dist/e2e/ZTab.app --args $PWD/dist/e2e/out.txt`. Needs an unlocked screen. |
+| End-to-end tests | Synthetic HID key and mouse events against a running ZTab. Bundle each one with `scripts/bundle.sh <bin> dist/<bin>/ZTab.app` and run it with `open -W -n -g dist/<bin>/ZTab.app --args <out.txt> …`. Needs an unlocked screen. |
+| `e2e` | Quick tap, MRU toggle, hold and navigate, Esc, and clicking a tile while holding ⌥. |
+| `e2e_more <out> <scratch-dir>` | Every display (panel on the mouse's screen, click a tile there), a minimized window, a hidden app, Shift+⌥Tab, and ⌥`. It opens and closes a scratch Finder window and a TextEdit document. |
+| `e2e_quit <out> <ztab-pid>` | Clicks the menu-bar icon, then "Quit ZTab". |
 | Unit tests | `cargo test` |
 
 ## Known limitations
