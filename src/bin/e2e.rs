@@ -12,14 +12,21 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use objc2_core_foundation::{CGPoint, CFRetained};
-use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
+use objc2_core_graphics::{
+    CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMouseButton,
+};
+
+thread_local! {
+    // Events from a HID-state source update the system modifier state like a real keyboard.
+    static SRC: CFRetained<CGEventSource> = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+}
 
 const OPTION: u16 = 0x3A;
 const TAB: u16 = 0x30;
 const ESC: u16 = 0x35;
 
 fn key(code: u16, down: bool, flags: CGEventFlags) {
-    let ev: CFRetained<CGEvent> = CGEvent::new_keyboard_event(None, code, down).unwrap();
+    let ev: CFRetained<CGEvent> = SRC.with(|src| CGEvent::new_keyboard_event(Some(src), code, down)).unwrap();
     CGEvent::set_flags(Some(&ev), flags);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
     sleep(Duration::from_millis(25));
@@ -37,10 +44,16 @@ fn tab() {
 }
 
 fn mouse(kind: CGEventType, p: CGPoint) {
-    let ev = CGEvent::new_mouse_event(None, kind, p, CGMouseButton::Left).unwrap();
+    let ev = SRC.with(|src| CGEvent::new_mouse_event(Some(src), kind, p, CGMouseButton::Left)).unwrap();
     CGEvent::set_flags(Some(&ev), CGEventFlags::MaskAlternate);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
     sleep(Duration::from_millis(40));
+}
+
+/// The window in front: topmost on-screen layer-0 window of a regular app. (AX "focused window"
+/// is unreliable as a probe: Chrome often doesn't answer it in time.)
+fn front_wid() -> Option<u32> {
+    windows::list_windows().into_iter().min_by_key(|w| w.z_index).map(|w| w.wid)
 }
 
 fn last_commit_wid() -> Option<u32> {
@@ -72,28 +85,41 @@ fn main() {
     report(format!("ax={} screen={}", windows::ax_trusted(), windows::screen_recording_granted()));
     let mut pass = true;
 
+    option_down();
+    let held = CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).contains(CGEventFlags::MaskAlternate);
+    option_up();
+    report(format!("synthetic option registers in session state: {held}"));
+    sleep(Duration::from_millis(300));
+
     // 1. Quick Option+Tab: switches to another window without showing the panel.
-    let before = windows::focused_window_id();
+    let before = front_wid();
     let n0 = commit_count();
     option_down();
     tab();
     option_up();
     sleep(Duration::from_millis(700));
-    let after = windows::focused_window_id();
+    let after = front_wid();
     let committed = last_commit_wid();
     let ok = commit_count() == n0 + 1 && after.is_some() && after == committed && after != before;
     pass &= ok;
     report(format!("CHECK quick-tap: before={before:?} after={after:?} committed={committed:?} -> {ok}"));
 
-    // 2. Quick Option+Tab again: should go back to the original window (MRU toggle).
+    // 2. Two more quick taps: MRU toggling must alternate between the last two windows.
+    let first = after;
     option_down();
     tab();
     option_up();
     sleep(Duration::from_millis(700));
-    let back = windows::focused_window_id();
-    let ok = back == before;
+    let second = front_wid();
+    let second_commit = last_commit_wid();
+    option_down();
+    tab();
+    option_up();
+    sleep(Duration::from_millis(700));
+    let third = front_wid();
+    let ok = first.is_some() && second.is_some() && second == second_commit && second != first && third == first;
     pass &= ok;
-    report(format!("CHECK toggle-back: now={back:?} expected={before:?} -> {ok}"));
+    report(format!("CHECK MRU toggle: tap1={first:?} tap2={second:?} tap3={third:?} -> {ok}"));
 
     // 3. Hold: Option+Tab, wait for panel, Tab twice, screenshot, release.
     let n0 = commit_count();
@@ -111,7 +137,7 @@ fn main() {
     }
     option_up();
     sleep(Duration::from_millis(700));
-    let after = windows::focused_window_id();
+    let after = front_wid();
     let committed = last_commit_wid();
     let ok = frame.is_some() && commit_count() == n0 + 1 && after == committed;
     pass &= ok;
@@ -122,7 +148,7 @@ fn main() {
     report(format!("CHECK panel hidden after release: {gone}"));
 
     // 4. Esc cancels: focus unchanged, no commit.
-    let before = windows::focused_window_id();
+    let before = front_wid();
     let n0 = commit_count();
     option_down();
     tab();
@@ -132,7 +158,7 @@ fn main() {
     sleep(Duration::from_millis(200));
     option_up();
     sleep(Duration::from_millis(500));
-    let after = windows::focused_window_id();
+    let after = front_wid();
     let ok = commit_count() == n0 && after == before && panel_frame().is_none();
     pass &= ok;
     report(format!("CHECK esc-cancel: before={before:?} after={after:?} commits+{} -> {ok}", commit_count() - n0));
@@ -154,7 +180,7 @@ fn main() {
         clicked = true;
     }
     sleep(Duration::from_millis(700));
-    let after_click = windows::focused_window_id();
+    let after_click = front_wid();
     let committed = last_commit_wid();
     let panel_gone = panel_frame().is_none();
     option_up();
