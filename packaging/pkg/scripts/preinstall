@@ -1,0 +1,20 @@
+#!/bin/bash
+# Before the bundle is replaced: remember whether the user had turned the login item off, then
+# quit a running ZTab (postinstall starts it again).
+# $2 is the install target: the user's home folder (the package installs into ~/Applications).
+TARGET="${2:-$HOME}"
+MARK="$TARGET/Library/Caches/dev.ztab.pkg.keep-login-off"
+rm -f "$MARK"
+# An upgrade with no login agent: the user unticked "Start ZTab at login" (or installed without
+# it). Keep that choice; a first install (no app yet) turns the login item on.
+if [ -d "$TARGET/Applications/ZTab.app" ] && [ ! -f "$TARGET/Library/LaunchAgents/dev.ztab.app.plist" ]; then
+  mkdir -p "$TARGET/Library/Caches" && touch "$MARK"
+fi
+if [ "$(id -u)" = 0 ]; then
+  UID_=$(id -u "$(stat -f %Su /dev/console)")
+else
+  UID_=$(id -u)
+fi
+pkill -u "$UID_" -x ztab 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -u "$UID_" -x ztab >/dev/null || break; sleep 0.1; done
+exit 0

@@ -1,0 +1,34 @@
+#!/bin/bash
+# Turn on ZTab's login item and start it. `ztab --set-login on` writes
+# ~/Library/LaunchAgents/dev.ztab.app.plist (launchd runs the binary directly) and loads it, which
+# starts ZTab right away. On an upgrade where the user had turned the login item off (preinstall
+# leaves a marker), the login item stays off and ZTab is just started. If the new ZTab is not
+# running a few seconds later (launchd refused the job, or another copy still held the
+# single-instance lock), it is started directly.
+# $2 is the install target: the user's home folder (the package installs into ~/Applications).
+TARGET="${2:-$HOME}"
+APP="$TARGET/Applications/ZTab.app"
+BIN="$APP/Contents/MacOS/ztab"
+MARK="$TARGET/Library/Caches/dev.ztab.pkg.keep-login-off"
+[ -x "$BIN" ] || { echo "ZTab postinstall: $BIN not found" >&2; rm -f "$MARK"; exit 0; }
+if [ "$(id -u)" = 0 ]; then
+  USER_NAME=$(stat -f %Su /dev/console); UID_=$(id -u "$USER_NAME")
+  run_as_user() { launchctl asuser "$UID_" sudo -u "$USER_NAME" "$@"; }
+else
+  UID_=$(id -u)
+  run_as_user() { "$@"; }
+fi
+running() { pgrep -u "$UID_" -f "$BIN" >/dev/null; }
+if [ -f "$MARK" ]; then
+  rm -f "$MARK"
+  echo "ZTab postinstall: start at login was off; leaving it off"
+elif ! run_as_user env -u ZTAB_SETTINGS_DIR "$BIN" --set-login on; then
+  echo "ZTab postinstall: the login item was not loaded" >&2
+fi
+for _ in $(seq 1 30); do running && break; sleep 0.1; done
+if ! running; then
+  run_as_user /usr/bin/open -g "$APP" || true
+  for _ in $(seq 1 30); do running && break; sleep 0.1; done
+  running || echo "ZTab postinstall: ZTab did not start (another copy may still be running)" >&2
+fi
+exit 0

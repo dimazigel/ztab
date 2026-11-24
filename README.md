@@ -46,12 +46,34 @@ It switches between *windows*, not apps.
 You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
 
 ```sh
-scripts/install.sh           # build, copy to ~/Applications/ZTab.app, launch
-scripts/install.sh --login   # same, and start ZTab at login (runs `ztab --set-login on`, see below)
+scripts/install.sh           # build, copy to ~/Applications/ZTab.app, start it now and at login (`ztab --set-login on`, see below)
+scripts/install.sh --no-login  # same, but only launch it (the login item is left as it is)
 scripts/uninstall.sh         # stop it, remove the login item and the app (settings are kept)
 scripts/bundle.sh            # just build dist/ZTab.app
 scripts/make-icon.sh         # regenerate packaging/AppIcon.icns from scripts/make-icon.swift
+scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.pkg
 ```
+
+### Installer package
+
+`scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). It installs
+`ZTab.app` into `~/Applications` of the user who runs it, so it needs no administrator password, and
+does what `install.sh` does: it quits a running ZTab first, then turns on the login item and
+starts ZTab. On an upgrade where you had turned *Start ZTab at login* off, it stays off.
+Double-click it, or from a terminal:
+
+```sh
+installer -pkg dist/ZTab-0.1.0.pkg -target CurrentUserHomeDirectory
+```
+
+The package is not notarized, so a copy downloaded from the internet is blocked on first open:
+allow it under *System Settings → Privacy & Security → Open Anyway*. (Avoiding that needs a paid
+Apple Developer ID: the app signed with *Developer ID Application* and the hardened runtime, the
+package signed with *Developer ID Installer* — `ZTAB_PKG_SIGN_IDENTITY` — then notarized and
+stapled.) The app inside is signed with the same
+identity as `bundle.sh` uses, so on this Mac the privacy grants carry over; on another Mac grant
+the two permissions below once. `scripts/uninstall.sh` removes a package install too
+(`pkgutil --volume ~ --forget dev.ztab.app.pkg` also drops the install receipt).
 
 **First launch: grant ZTab two permissions** in *System Settings → Privacy & Security*:
 
@@ -157,12 +179,12 @@ started). The command line also loads or unloads the job:
 binary, `off` (exit 1), `on, but for another copy of ZTab (<path>)` or `broken: the program it starts
 does not exist (<path>)` (exit 3). If `launchctl bootstrap` fails (for example when ZTab is switched
 off under *Allow in the Background*), `--set-login on` says that the file was written but not
-loaded, and `install.sh --login` then starts ZTab directly, so a reinstall never leaves it stopped.
+loaded, and `install.sh` then starts ZTab directly, so a reinstall never leaves it stopped.
 
 Replacing the binary of a loaded agent (copying a new build over `~/Applications/ZTab.app`) and
 starting the job at once fails: launchd refuses the new binary with a launch-constraint violation
 (`OS_REASON_CODESIGNING` in `launchctl print gui/$UID/dev.ztab.app`) until Background Task
-Management has registered it again, a few seconds later. `install.sh --login` reloads the job
+Management has registered it again, a few seconds later. `install.sh` reloads the job
 (`--set-login on`), which avoids it.
 
 Only one ZTab runs at a time: each takes an exclusive lock on `dev.ztab.app.lock` in the user's
