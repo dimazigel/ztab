@@ -9,11 +9,9 @@
 #[path = "../hotkey.rs"]
 mod hotkey;
 
-use std::cell::Cell;
 use std::ffi::c_void;
 use std::io::Write;
 use std::ptr::NonNull;
-use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -201,11 +199,10 @@ fn main() {
     let sc = CGPreflightScreenCaptureAccess();
     log(format!("pid={} AXIsProcessTrusted={ax} CGPreflightScreenCaptureAccess={sc}", std::process::id()));
 
-    let handle_slot: Rc<Cell<Option<HotkeyHandle>>> = Rc::new(Cell::new(None));
-    let slot = handle_slot.clone();
+    static SLOT: std::sync::OnceLock<HotkeyHandle> = std::sync::OnceLock::new();
     let t0 = Instant::now();
-    let handler = Box::new(move |ev: HotkeyEvent| {
-        log(format!("EVENT {:?} at {:.3}s (open now={:?})", ev, t0.elapsed().as_secs_f64(), slot.get().map(|h| h.is_open())));
+    let handler = Box::new(move |ev: HotkeyEvent, _session: u64| {
+        log(format!("EVENT {:?} at {:.3}s (open now={:?})", ev, t0.elapsed().as_secs_f64(), SLOT.get().map(|h| h.is_open())));
         HOTKEY_EVENTS.lock().unwrap().push(ev);
         let ms = STALL_MS.swap(0, std::sync::atomic::Ordering::SeqCst);
         if ms > 0 && matches!(ev, HotkeyEvent::Open { .. }) {
@@ -213,7 +210,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(ms));
             log("  handler stall over");
         }
-        if let Some(h) = slot.get() {
+        if let Some(h) = SLOT.get() {
             match ev {
                 HotkeyEvent::Open { .. } | HotkeyEvent::OpenSameApp { .. } => h.set_open(true),
                 HotkeyEvent::Commit | HotkeyEvent::Cancel => h.set_open(false),
@@ -230,7 +227,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    handle_slot.set(Some(hk.handle()));
+    let _ = SLOT.set(hk.handle());
     let loc = hk.location();
     log(format!(
         "install: Ok, location={} enabled={} is_open={}",

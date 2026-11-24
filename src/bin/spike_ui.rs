@@ -131,6 +131,7 @@ fn main() {
         aspect,
         minimized: min,
         group,
+        ..Default::default()
     };
     let tiles = vec![
         tile("Mail", "Inbox — 1,204 messages", &mail, Some(fake_thumb(1600.0, 1000.0, blue, "Inbox", false)), 1.6, false, 0),
@@ -198,8 +199,8 @@ fn main() {
     out!("snapshot ui-light.png ok={ok}");
 
     // Fill a missing thumbnail (idx 3 "Sent") before the dark snapshot.
-    s.set_thumbnail(3, fake_thumb(1500.0, 1000.0, blue, "Sent", true));
-    s.set_thumbnail(99, fake_thumb(10.0, 10.0, blue, "x", true)); // out of range: ignored
+    s.set_thumbnail(3, fake_thumb(1500.0, 1000.0, blue, "Sent", true), None);
+    s.set_thumbnail(99, fake_thumb(10.0, 10.0, blue, "x", true), None); // out of range: ignored
     s.set_selected(7);
     s.set_dark(Some(true));
     let ok = s.snapshot_png(&format!("{outdir}/ui-dark.png"));
@@ -326,6 +327,7 @@ fn main() {
                     aspect,
                     minimized: v.len() % 11 == 5,
                     group: g,
+                    ..Default::default()
                 });
             }
             g += 1;

@@ -1,5 +1,7 @@
 //! Spike for src/thumbs.rs.
-//! Usage: spike_thumbs <outdir> [max_w max_h]
+//! Usage: spike_thumbs <outdir> [max_w max_h] [--offscreen | --selftest | --refresh]
+//! --refresh: background refresh (refresh_stale / capture_one / capture through the bounded
+//! scheduler) with main-thread latency, heartbeat, in-flight, CPU and backoff checks.
 //! Writes <outdir>/out.txt (report), <wid>.png (async capture), <wid>_sync.png (capture_sync),
 //! <wid>_cg.png (CGWindowListCreateImage path).
 #[path = "../thumbs.rs"]
@@ -171,9 +173,11 @@ fn main() {
         file: std::fs::File::create(format!("{outdir}/out.txt")).expect("out.txt"),
     };
 
+    let refresh = args.iter().any(|a| a == "--refresh");
     // Hard watchdog: `open -W` must never hang.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(20));
+    let limit = if refresh { 120 } else { 20 };
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(limit));
         eprintln!("watchdog exit");
         std::process::exit(3);
     });
@@ -181,6 +185,14 @@ fn main() {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+
+    if refresh {
+        // Before anything touches the Screen Recording preflight on main: the first
+        // refresh_stale call must also be cheap.
+        refresh_mode(&outdir, &mut out);
+        out.line("done");
+        return;
+    }
 
     let ax = unsafe { objc2_application_services::AXIsProcessTrusted() };
     let sc = thumbs::screen_capture_allowed();
@@ -579,4 +591,405 @@ fn selftest(outdir: &str, out: &mut Out, mtm: MainThreadMarker, max_w: f64, max_
     }
     out.line(&format!("minimized async callbacks: {}", got.lock().unwrap()));
     win.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// --refresh
+
+/// Main run-loop heartbeat: the longest gap between loop iterations, i.e. the longest time the
+/// main thread spent away from its run loop (callbacks, our own calls).
+struct Heartbeat {
+    last: Instant,
+    max_gap: Duration,
+    over_50: usize,
+    /// Highest `in_flight` seen by sampling between iterations.
+    max_in_flight: usize,
+    phase: &'static str,
+    max_phase: &'static str,
+}
+
+impl Heartbeat {
+    fn new() -> Self {
+        Heartbeat {
+            last: Instant::now(),
+            max_gap: Duration::ZERO,
+            over_50: 0,
+            max_in_flight: 0,
+            phase: "start",
+            max_phase: "",
+        }
+    }
+    fn spin(&mut self, t: &thumbs::Thumbnailer, dur: Duration) {
+        let until = Instant::now() + dur;
+        while Instant::now() < until {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.005, true);
+            self.beat();
+            self.max_in_flight = self.max_in_flight.max(t.stats().in_flight);
+        }
+    }
+    fn beat(&mut self) {
+        let gap = self.last.elapsed();
+        if gap > self.max_gap {
+            self.max_gap = gap;
+            self.max_phase = self.phase;
+        }
+        if gap > Duration::from_millis(50) {
+            self.over_50 += 1;
+        }
+        self.last = Instant::now();
+    }
+}
+
+fn cpu_time() -> Duration {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+fn ps_cpu() -> String {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "%cpu=,time=", "-p", &std::process::id().to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| e.to_string())
+}
+
+/// Timed main-thread call.
+fn timed(lat: &mut Duration, f: impl FnOnce()) {
+    let t0 = Instant::now();
+    f();
+    *lat = (*lat).max(t0.elapsed());
+}
+
+fn us(d: Duration) -> String {
+    format!("{:.0}us", d.as_secs_f64() * 1e6)
+}
+
+fn refresh_mode(outdir: &str, out: &mut Out) {
+    let wins = list_windows(false);
+    let wids: Vec<u32> = wins.iter().map(|w| w.wid).collect();
+    out.line(&format!("REFRESH: on-screen layer-0 windows: {}", wids.len()));
+    let t = thumbs::Thumbnailer::new();
+    let updates = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let off_main = Arc::new(Mutex::new(0usize));
+    {
+        let u = updates.clone();
+        let om = off_main.clone();
+        t.set_on_update(move |wid| {
+            if MainThreadMarker::new().is_none() {
+                *om.lock().unwrap() += 1;
+            }
+            u.lock().unwrap().push(wid);
+        });
+    }
+    let mut hb = Heartbeat::new();
+    let mut lat_refresh = Duration::ZERO;
+    let mut lat_first = Duration::ZERO;
+    let mut lat_other = Duration::ZERO;
+    let max_age = Duration::from_secs(30);
+    let tick = Duration::from_millis(500);
+    let budget = 4;
+
+    hb.phase = "warm";
+    // ---- phase 1: warm the cache, refresh_stale(budget 4) every 500 ms ----
+    let cpu0 = cpu_time();
+    let t_start = Instant::now();
+    let mut warm_after = None;
+    let mut n = 0;
+    while t_start.elapsed() < Duration::from_secs(20) {
+        let t0 = Instant::now();
+        t.refresh_stale(&wids, max_age, budget);
+        let d = t0.elapsed();
+        if n == 0 {
+            lat_first = d;
+        }
+        lat_refresh = lat_refresh.max(d);
+        hb.beat();
+        n += 1;
+        hb.spin(&t, tick);
+        let cached = wids.iter().filter(|w| t.has_cached(**w)).count();
+        let s = t.stats();
+        out.line(&format!(
+            "  tick {n:2} +{:6} call={:>6} cached {cached}/{} started={} ok={} failed={} fetches={} in_flight={} queued={} peak={}",
+            ms(t_start.elapsed()),
+            us(d),
+            wids.len(),
+            s.started,
+            s.ok,
+            s.failed,
+            s.content_fetches,
+            s.in_flight,
+            s.queued,
+            s.peak_in_flight
+        ));
+        if s.in_flight == 0 && s.queued == 0 && warm_after.is_none() {
+            // Everything that could be captured has been (failures are backing off).
+            let pending = wids
+                .iter()
+                .filter(|w| !t.has_cached(**w))
+                .count();
+            if pending == 0 || s.started >= wids.len() as u64 {
+                warm_after = Some(t_start.elapsed());
+                break;
+            }
+        }
+    }
+    let warm_wall = t_start.elapsed();
+    let warm_cpu = cpu_time() - cpu0;
+    let s1 = t.stats();
+    let cached_n = wids.iter().filter(|w| t.has_cached(**w)).count();
+    out.line(&format!(
+        "WARM: {cached_n}/{} cached after {:?} ({n} calls); cpu {} over wall {} = {:.1}% ; stats {s1:?}",
+        wids.len(),
+        warm_after.map(ms),
+        ms(warm_cpu),
+        ms(warm_wall),
+        100.0 * warm_cpu.as_secs_f64() / warm_wall.as_secs_f64()
+    ));
+    let missing: Vec<u32> = wids.iter().copied().filter(|w| !t.has_cached(*w)).collect();
+    out.line(&format!("  not cached: {missing:?}"));
+    out.line(&format!("  ps %cpu,time after warm: {}", ps_cpu()));
+    hb.last = Instant::now(); // ps runs synchronously on main: not a thumbs stall
+
+    hb.phase = "within-max-age";
+    // ---- phase 2: calls within max_age must capture nothing and fetch nothing ----
+    let s0 = t.stats();
+    let cpu0 = cpu_time();
+    let t0w = Instant::now();
+    for _ in 0..10 {
+        let t0 = Instant::now();
+        t.refresh_stale(&wids, max_age, budget);
+        lat_refresh = lat_refresh.max(t0.elapsed());
+        hb.beat();
+        hb.spin(&t, tick);
+    }
+    let s2 = t.stats();
+    let idle_cpu = cpu_time() - cpu0;
+    out.line(&format!(
+        "WITHIN MAX_AGE: 10 calls over {}: captures started {} (expect 0), content fetches {} (expect 0); cpu {} = {:.2}%",
+        ms(t0w.elapsed()),
+        s2.started - s0.started,
+        s2.content_fetches - s0.content_fetches,
+        ms(idle_cpu),
+        100.0 * idle_cpu.as_secs_f64() / t0w.elapsed().as_secs_f64()
+    ));
+
+    hb.phase = "capture_one";
+    // ---- phase 3: capture_one refreshes one window now ----
+    if let Some(&w0) = wids.iter().find(|w| t.has_cached(**w)) {
+        let before = t.cache_age(w0);
+        let s0 = t.stats();
+        timed(&mut lat_other, || t.capture_one(w0));
+        hb.beat();
+        hb.spin(&t, Duration::from_millis(600));
+        let s1 = t.stats();
+        out.line(&format!(
+            "CAPTURE_ONE wid={w0}: age before {:?} after {:?}; started +{} ok +{}; on_update count for it {}",
+            before.map(ms),
+            t.cache_age(w0).map(ms),
+            s1.started - s0.started,
+            s1.ok - s0.ok,
+            updates.lock().unwrap().iter().filter(|w| **w == w0).count()
+        ));
+        // Twice in a row while the first is in flight: one capture.
+        let s0 = t.stats();
+        timed(&mut lat_other, || t.capture_one(w0));
+        timed(&mut lat_other, || t.capture_one(w0));
+        hb.beat();
+        hb.spin(&t, Duration::from_millis(600));
+        out.line(&format!(
+            "CAPTURE_ONE x2 back-to-back: started +{} (expect 1, or 2 if the first finished before the second was queued)",
+            t.stats().started - s0.started
+        ));
+    }
+
+    hb.phase = "bogus";
+    // ---- phase 4: a gone window is not retried in a storm ----
+    let bogus = 0xFFFF_FF00u32;
+    let s0 = t.stats();
+    for _ in 0..8 {
+        timed(&mut lat_refresh, || t.refresh_stale(&[bogus], Duration::ZERO, budget));
+        hb.beat();
+        hb.spin(&t, tick);
+    }
+    let s1 = t.stats();
+    out.line(&format!(
+        "BOGUS wid: 8 calls over 4 s -> started +{} failed +{} fetches +{} (expect 1 / 1 / <=2); has_cached={}",
+        s1.started - s0.started,
+        s1.failed - s0.failed,
+        s1.content_fetches - s0.content_fetches,
+        t.has_cached(bogus)
+    ));
+
+    hb.phase = "continuous";
+    // ---- phase 5: everything stale every call (max_age 0) -> bounded concurrency, CPU ----
+    t.reset_peak();
+    hb.max_in_flight = 0;
+    let s0 = t.stats();
+    let cpu0 = cpu_time();
+    let t0w = Instant::now();
+    for _ in 0..10 {
+        timed(&mut lat_refresh, || t.refresh_stale(&wids, Duration::ZERO, budget));
+        hb.beat();
+        hb.spin(&t, tick);
+    }
+    let wall = t0w.elapsed();
+    let cpu = cpu_time() - cpu0;
+    let s1 = t.stats();
+    out.line(&format!(
+        "CONTINUOUS (max_age 0, budget 4, 500 ms): started +{} ok +{} failed +{} fetches +{}; peak in flight {} (scheduler) / {} (sampled), limit 3; cpu {} over {} = {:.1}%; ps {}",
+        s1.started - s0.started,
+        s1.ok - s0.ok,
+        s1.failed - s0.failed,
+        s1.content_fetches - s0.content_fetches,
+        s1.peak_in_flight,
+        hb.max_in_flight,
+        ms(cpu),
+        ms(wall),
+        100.0 * cpu.as_secs_f64() / wall.as_secs_f64(),
+        ps_cpu()
+    ));
+    hb.last = Instant::now(); // ps runs synchronously on main: not a thumbs stall
+    hb.spin(&t, Duration::from_millis(500));
+
+    hb.phase = "capture()";
+    // ---- phase 6: switcher captures (capture()) through the scheduler ----
+    for (label, int_limit) in [("limit 3", 3usize), ("limit 8", 8), ("limit 3 again", 3)] {
+        t.set_concurrency(3, int_limit);
+        t.reset_peak();
+        let got = Arc::new(Mutex::new(Vec::<(u32, Duration)>::new()));
+        let g2 = got.clone();
+        let started = Instant::now();
+        timed(&mut lat_other, || {
+            t.capture(wids.clone(), 300.0, 190.0, 1, move |_, wid, _| {
+                g2.lock().unwrap().push((wid, started.elapsed()))
+            })
+        });
+        hb.beat();
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && got.lock().unwrap().len() < cached_n {
+            hb.spin(&t, Duration::from_millis(5));
+        }
+        let g = got.lock().unwrap();
+        let first = g.first().map(|x| x.1).unwrap_or_default();
+        let last = g.iter().map(|x| x.1).max().unwrap_or_default();
+        out.line(&format!(
+            "CAPTURE() {label}: {} of {} delivered, first +{} last +{}; peak in flight {}",
+            g.len(),
+            wids.len(),
+            ms(first),
+            ms(last),
+            t.stats().peak_in_flight
+        ));
+        drop(g);
+        hb.spin(&t, Duration::from_millis(300));
+    }
+    t.set_concurrency(3, 3);
+
+    hb.phase = "priority";
+    // ---- phase 7: capture() for a selected window while refresh work is queued ----
+    {
+        t.reset_peak();
+        // Queue a full background round, then ask for the last window interactively.
+        t.refresh_stale(&wids, Duration::ZERO, wids.len());
+        let target = *wids.last().unwrap();
+        let got = Arc::new(Mutex::new(None));
+        let g2 = got.clone();
+        let started = Instant::now();
+        t.capture(vec![target], 300.0, 190.0, 2, move |_, _, _| {
+            *g2.lock().unwrap() = Some(started.elapsed())
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && got.lock().unwrap().is_none() {
+            hb.spin(&t, Duration::from_millis(5));
+        }
+        out.line(&format!(
+            "PRIORITY: interactive capture behind a {}-window background round delivered at +{:?}; peak in flight {}",
+            wids.len(),
+            got.lock().unwrap().map(ms),
+            t.stats().peak_in_flight
+        ));
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && (t.stats().in_flight > 0 || t.stats().queued > 0) {
+            hb.spin(&t, Duration::from_millis(20));
+        }
+    }
+
+    // ---- phase 8: main-thread cost of cache reads ----
+    let mut lat_cached = Duration::ZERO;
+    for w in &wids {
+        timed(&mut lat_cached, || {
+            let _ = t.cached(*w);
+        });
+        timed(&mut lat_cached, || {
+            let _ = t.has_cached(*w);
+        });
+        timed(&mut lat_cached, || {
+            let _ = t.cache_age(*w);
+        });
+    }
+
+    hb.phase = "retain_only";
+    // ---- phase 9: retain_only keeps listed windows ----
+    let before = wids.iter().filter(|w| t.has_cached(**w)).count();
+    t.retain_only(&wids);
+    let after_all = wids.iter().filter(|w| t.has_cached(**w)).count();
+    let w0 = wids[0];
+    t.retain_only(&wids[1..]);
+    let after_drop = wids[1..].iter().filter(|w| t.has_cached(**w)).count();
+    out.line(&format!(
+        "RETAIN_ONLY: cached {before}; after retain_only(all) {after_all}; after retain_only(all but {w0}): {w0} cached={} others {after_drop}/{}",
+        t.has_cached(w0),
+        wids.len() - 1
+    ));
+    // An in-flight capture of a window dropped meanwhile must not re-add it.
+    let ok0 = t.stats().ok;
+    t.capture_one(w0);
+    let until = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < until && t.stats().in_flight == 0 {
+        std::hint::spin_loop();
+    }
+    let was_in_flight = t.stats().in_flight > 0;
+    t.retain_only(&wids[1..]);
+    hb.last = Instant::now();
+    hb.spin(&t, Duration::from_millis(500));
+    out.line(&format!(
+        "RETAIN_ONLY during in-flight capture (in flight at retain: {was_in_flight}, capture ok +{}): {w0} cached={} (expect false)",
+        t.stats().ok - ok0,
+        t.has_cached(w0)
+    ));
+
+    out.line(&format!(
+        "MAIN THREAD: refresh_stale max {} (first call {}), capture/capture_one max {}, cached/has_cached/cache_age max {}",
+        us(lat_refresh),
+        us(lat_first),
+        us(lat_other),
+        us(lat_cached)
+    ));
+    out.line(&format!(
+        "HEARTBEAT: max main-loop gap {} (phase {}) ; gaps > 50 ms: {} ; on_update callbacks {} ({} off main)",
+        ms(hb.max_gap),
+        hb.max_phase,
+        hb.over_50,
+        updates.lock().unwrap().len(),
+        off_main.lock().unwrap()
+    ));
+    let allowed = std::thread::spawn(thumbs::screen_capture_allowed).join().unwrap_or(false);
+    out.line(&format!("screen_capture_allowed (checked off main) = {allowed}; final stats {:?}", t.stats()));
+
+    // PNGs of a few cached thumbnails (after measurements: encoding is slow).
+    for w in wins.iter().filter(|w| t.has_cached(w.wid)).take(4) {
+        if let Some(img) = t.cached(w.wid) {
+            let path = format!("{outdir}/refresh_{}.png", w.wid);
+            let r = write_png(&img, &path);
+            out.line(&format!(
+                "  png wid={} owner={:?} {:?} {} -> {path}",
+                w.wid,
+                w.owner,
+                r,
+                stats(&img)
+            ));
+        }
+    }
 }

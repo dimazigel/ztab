@@ -11,6 +11,7 @@ use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
+use objc2_app_kit::NSWorkspace;
 use objc2_core_foundation::{CGPoint, CFRetained};
 use objc2_core_graphics::{
     CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMouseButton,
@@ -76,6 +77,23 @@ fn panel_frame() -> Option<(f64, f64, f64, f64)> {
     (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
 }
 
+/// Tile centers (wid, point) of the panel currently shown, from ZTab's `panel shown:` line.
+fn panel_tiles() -> Vec<(u32, CGPoint)> {
+    let Some(log) = std::fs::read_to_string(std::env::var("HOME").unwrap() + "/Library/Logs/ztab.log").ok() else { return vec![] };
+    let Some(line) = log.lines().rev().find(|l| l.contains("panel shown:") || l.contains("panel hidden")) else { return vec![] };
+    line.split("tiles=")
+        .nth(1)
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|t| {
+            let mut parts = t.trim().split(':');
+            let wid = parts.next()?.parse().ok()?;
+            let (x, y) = parts.next()?.split_once(',')?;
+            Some((wid, CGPoint { x: x.parse().ok()?, y: y.trim().parse().ok()? }))
+        })
+        .collect()
+}
+
 fn main() {
     let out_path = std::env::args().nth(1).unwrap_or_else(|| "/dev/stdout".into());
     let mut out = std::fs::File::create(&out_path).unwrap();
@@ -91,8 +109,14 @@ fn main() {
     report(format!("synthetic option registers in session state: {held}"));
     sleep(Duration::from_millis(300));
 
-    // 1. Quick Option+Tab: switches to another window without showing the panel.
-    let before = front_wid();
+    // 1. Quick Option+Tab: switches to another window without showing the panel. When the
+    // frontmost app has no window in front (e.g. Finder with only the desktop, as a previous
+    // suite's cleanup can leave it), the user is in no window: the quick tap goes to the most
+    // recent window, which may be the one already on top.
+    let top = windows::list_windows().into_iter().min_by_key(|w| w.z_index);
+    let before = top.as_ref().map(|w| w.wid);
+    let front_app = NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier());
+    let in_window = top.as_ref().is_some_and(|w| Some(w.pid) == front_app);
     let n0 = commit_count();
     option_down();
     tab();
@@ -100,9 +124,9 @@ fn main() {
     sleep(Duration::from_millis(700));
     let after = front_wid();
     let committed = last_commit_wid();
-    let ok = commit_count() == n0 + 1 && after.is_some() && after == committed && after != before;
+    let ok = commit_count() == n0 + 1 && after.is_some() && after == committed && (after != before || !in_window);
     pass &= ok;
-    report(format!("CHECK quick-tap: before={before:?} after={after:?} committed={committed:?} -> {ok}"));
+    report(format!("CHECK quick-tap: before={before:?} in_window={in_window} after={after:?} committed={committed:?} -> {ok}"));
 
     // 2. Two more quick taps: MRU toggling must alternate between the last two windows.
     let first = after;
@@ -163,16 +187,16 @@ fn main() {
     pass &= ok;
     report(format!("CHECK esc-cancel: before={before:?} after={after:?} commits+{} -> {ok}", commit_count() - n0));
 
-    // 5. Mouse: hold Option+Tab, click the first tile while Option is held.
+    // 5. Mouse: hold Option+Tab, click the first tile (its center, from ZTab's log) while Option is
+    // held.
     let n0 = commit_count();
     option_down();
     tab();
     sleep(Duration::from_millis(500));
     let frame = panel_frame();
+    let target = panel_tiles().into_iter().next();
     let mut clicked = false;
-    if let Some((x, y, _, _)) = frame {
-        // First tile: panel padding + group padding + a bit into the thumbnail.
-        let p = CGPoint { x: x + 60.0, y: y + 60.0 };
+    if let (Some(_), Some((_, p))) = (frame, target) {
         mouse(CGEventType::MouseMoved, CGPoint { x: p.x + 3.0, y: p.y });
         mouse(CGEventType::MouseMoved, p);
         mouse(CGEventType::LeftMouseDown, p);
@@ -185,10 +209,11 @@ fn main() {
     let panel_gone = panel_frame().is_none();
     option_up();
     sleep(Duration::from_millis(400));
-    let ok = clicked && commit_count() == n0 + 1 && after_click == committed && panel_gone && commit_count() == n0 + 1;
+    let ok = clicked && commit_count() == n0 + 1 && committed == target.map(|t| t.0) && after_click == committed && panel_gone;
     pass &= ok;
     report(format!(
-        "CHECK click-while-holding: panel={frame:?} focused={after_click:?} committed={committed:?} panel_gone_before_release={panel_gone} -> {ok}"
+        "CHECK click-while-holding: panel={frame:?} clicked={:?} focused={after_click:?} committed={committed:?} panel_gone_before_release={panel_gone} -> {ok}",
+        target.map(|t| t.0)
     ));
 
     report(format!("RESULT {}", if pass { "PASS" } else { "FAIL" }));

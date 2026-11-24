@@ -87,8 +87,10 @@ fn panel() -> Option<((f64, f64, f64, f64), Vec<(u32, CGPoint)>)> {
         .unwrap_or("")
         .split(';')
         .filter_map(|t| {
-            let (wid, xy) = t.split_once(':')?;
-            let (x, y) = xy.split_once(',')?;
+            // `wid:x,y:t` (t = 1 when the tile had a thumbnail when shown); older logs had no `:t`.
+            let mut parts = t.trim().split(':');
+            let wid = parts.next()?;
+            let (x, y) = parts.next()?.split_once(',')?;
             Some((wid.parse().ok()?, CGPoint { x: x.parse().ok()?, y: y.trim().parse().ok()? }))
         })
         .collect();
@@ -251,9 +253,9 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     sleep(Duration::from_millis(800));
 
-    // 4. Shift+Option+Tab quick tap: least recently used window (largest z) among on-current-Space ones.
-    let list = windows::list_windows();
-    let expected = list.iter().max_by_key(|w| w.z_index).map(|w| w.wid);
+    // 4. Shift+Option+Tab quick tap: the least recently used window, i.e. the tail of the MRU
+    // order ZTab logs on its `open:` line. It must not be one of the windows this suite just
+    // used (the MRU head), and focus must land on it.
     let n0 = commit_count();
     option_down();
     key(SHIFT, true, CGEventFlags::MaskAlternate | CGEventFlags::MaskShift);
@@ -263,14 +265,29 @@ fn main() {
     option_up();
     sleep(Duration::from_millis(900));
     let committed = (commit_count() > n0).then(last_commit_wid).flatten();
+    let opened = ztab_log().lines().rev().find(|l| l.contains("open:")).unwrap_or("").to_string();
+    let mru: Vec<u32> = opened
+        .split(" mru=")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .map(|r| r.split(',').filter_map(|w| w.parse().ok()).collect())
+        .unwrap_or_default();
+    let expected = mru.last().copied();
+    let head: Vec<u32> = mru.iter().take(2).copied().collect();
     let front = front_wid();
     report(
-        committed.is_some() && committed == expected && front == committed,
-        format!("shift+option+tab: expected least-recent={expected:?} committed={committed:?} front={front:?}"),
+        mru.len() >= 3 && opened.contains("reverse=true") && committed.is_some() && committed == expected && !head.contains(&expected.unwrap_or(0)) && front == committed,
+        format!("shift+option+tab: mru_len={} expected least-recent={expected:?} committed={committed:?} front={front:?}", mru.len()),
     );
 
-    // 5. Option+` with Finder frontmost: only Finder windows, switch stays in Finder.
-    osa(&format!("tell application \"Finder\" to make new Finder window to (POSIX file \"{scratch}\" as alias)"));
+    // 5. Option+` with Finder frontmost: only Finder windows, switch stays in Finder. The suite
+    // opens two scratch Finder windows itself (it must not depend on the user having one open).
+    let same_dirs: Vec<String> = ["ztab-e2e-same-1", "ztab-e2e-same-2"].iter().map(|n| format!("{scratch}/{n}")).collect();
+    for d in &same_dirs {
+        let _ = std::fs::create_dir_all(d);
+        osa(&format!("tell application \"Finder\" to make new Finder window to (POSIX file \"{d}\" as alias)"));
+        sleep(Duration::from_millis(400));
+    }
     osa("tell application \"Finder\" to activate");
     sleep(Duration::from_millis(1000));
     let finder: Vec<u32> = windows::list_windows().into_iter().filter(|w| w.app_name == "Finder").map(|w| w.wid).collect();
@@ -286,8 +303,16 @@ fn main() {
     let count_ok = opened.contains(&format!("open: {} windows", finder.len())) && opened.contains("same_app=true");
     let ok = finder.len() >= 2 && count_ok && committed.map(|c| finder.contains(&c)).unwrap_or(false) && committed != before;
     report(ok, format!("option+` in Finder: finder_windows={} before={before:?} committed={committed:?} log_ok={count_ok}", finder.len()));
-    let name = std::path::Path::new(&scratch).file_name().unwrap().to_string_lossy().to_string();
-    osa(&format!("tell application \"Finder\" to close window \"{name}\""));
+    for d in &same_dirs {
+        let name = std::path::Path::new(d).file_name().unwrap().to_string_lossy().to_string();
+        osa(&format!("tell application \"Finder\" to close window \"{name}\""));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    // Safety net: close every Finder window still showing the scratch folder or one inside it.
+    osa(&format!(
+        "tell application \"Finder\"\nrepeat with w in (get every Finder window)\ntry\nif POSIX path of (target of w as alias) starts with \"{scratch}\" then close w\nend try\nend repeat\nend tell"
+    ));
 
     let _ = writeln!(out, "RESULT {}", if pass { "PASS" } else { "FAIL" });
 }
