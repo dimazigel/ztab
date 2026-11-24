@@ -7,6 +7,7 @@
 #[allow(dead_code)]
 mod windows;
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
@@ -69,6 +70,59 @@ fn commit_count() -> usize {
         .unwrap_or(0)
 }
 
+/// The last `open:` line ZTab logged: (current index, selected index, the switcher's window order).
+fn last_open() -> Option<(Option<usize>, usize, Vec<u32>)> {
+    let log = std::fs::read_to_string(std::env::var("HOME").unwrap() + "/Library/Logs/ztab.log").ok()?;
+    let line = log.lines().rev().find(|l| l.contains("] open: "))?;
+    let cur = line.split("current=Some(").nth(1).and_then(|r| r.split(')').next()?.parse().ok());
+    let sel = line.split(" selected=").nth(1)?.split(' ').next()?.parse().ok()?;
+    let order = line.split(" order=").nth(1)?.split_whitespace().next()?.split(',').filter_map(|w| w.parse().ok()).collect();
+    Some((cur, sel, order))
+}
+
+/// Owner pids of windows (CoreGraphics).
+fn owner_pids(wids: &[u32]) -> HashMap<u32, i32> {
+    windows::cg_describe(wids).iter().filter_map(|d| windows::parse_cg(d)).map(|f| (f.0, f.1)).collect()
+}
+
+/// Whether `order` keeps each app's windows together (windows CoreGraphics no longer knows are
+/// ignored).
+fn grouped(order: &[u32], pids: &HashMap<u32, i32>) -> bool {
+    let mut seen = HashSet::new();
+    let mut last = None;
+    for p in order.iter().filter_map(|w| pids.get(w)) {
+        if last != Some(*p) && !seen.insert(*p) {
+            return false;
+        }
+        last = Some(*p);
+    }
+    true
+}
+
+/// A quick tap's session follows the rule: the order is grouped by app, the preselected window
+/// is the one after the current window (the first one without a current window), and it is
+/// what got committed. Returns (ok, detail, current wid, current app has another window).
+fn quick_tap_rule(committed: Option<u32>) -> (bool, String, Option<u32>, bool) {
+    let Some((cur, sel, order)) = last_open() else { return (false, "no open: line with order=".into(), None, false) };
+    let pids = owner_pids(&order);
+    let n = order.len();
+    let want = match cur {
+        Some(c) if n > 0 => (c + 1) % n,
+        _ => 0,
+    };
+    let cur_wid = cur.and_then(|c| order.get(c).copied());
+    let cur_pid = cur_wid.and_then(|w| pids.get(&w).copied());
+    let siblings = cur_pid.is_some_and(|p| order.iter().filter(|w| pids.get(w) == Some(&p)).count() >= 2);
+    let same_app_next = !siblings || order.get(want).and_then(|w| pids.get(w)) == cur_pid.as_ref();
+    let g = grouped(&order, &pids);
+    let ok = g && sel == want && committed == order.get(sel).copied() && same_app_next;
+    let detail = format!(
+        "current={cur:?} ({cur_wid:?}) selected={sel} (want {want}) wid={:?} grouped={g} app has another window={siblings} -> same app={same_app_next}",
+        order.get(sel)
+    );
+    (ok, detail, cur_wid, siblings)
+}
+
 /// Frame (x, y, w, h) of ZTab's switcher panel if it is currently shown (from ZTab's log).
 fn panel_frame() -> Option<(f64, f64, f64, f64)> {
     let log = std::fs::read_to_string(std::env::var("HOME").unwrap() + "/Library/Logs/ztab.log").ok()?;
@@ -109,10 +163,13 @@ fn main() {
     report(format!("synthetic option registers in session state: {held}"));
     sleep(Duration::from_millis(300));
 
-    // 1. Quick Option+Tab: switches to another window without showing the panel. When the
-    // frontmost app has no window in front (e.g. Finder with only the desktop, as a previous
-    // suite's cleanup can leave it), the user is in no window: the quick tap goes to the most
-    // recent window, which may be the one already on top.
+    // 1. Quick Option+Tab: switches without showing the panel, to the window after the current
+    // one in the switcher's order (`order=` on ZTab's `open:` line: the current app's other
+    // windows first, then the other apps by their most recent open window; checked grouped by app
+    // with CoreGraphics' owner pids). When the frontmost app has no window in front (e.g. Finder
+    // with only the desktop, as a previous suite's cleanup can leave it), the user is in no
+    // window: the quick tap goes to the first window of the order, which may be the one already
+    // on top.
     let top = windows::list_windows().into_iter().min_by_key(|w| w.z_index);
     let before = top.as_ref().map(|w| w.wid);
     let front_app = NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier());
@@ -124,11 +181,16 @@ fn main() {
     sleep(Duration::from_millis(700));
     let after = front_wid();
     let committed = last_commit_wid();
-    let ok = commit_count() == n0 + 1 && after.is_some() && after == committed && (after != before || !in_window);
+    let (rule, detail, _, _) = quick_tap_rule(committed);
+    let ok = commit_count() == n0 + 1 && after.is_some() && after == committed && (after != before || !in_window) && rule;
     pass &= ok;
-    report(format!("CHECK quick-tap: before={before:?} in_window={in_window} after={after:?} committed={committed:?} -> {ok}"));
+    report(format!("CHECK quick-tap: before={before:?} in_window={in_window} after={after:?} committed={committed:?} {detail} -> {ok}"));
 
-    // 2. Two more quick taps: MRU toggling must alternate between the last two windows.
+    // 2. Two more quick taps, each to the window after the current one. From a window whose app
+    // has another window, the next one is that app's (same app first), and a second tap returns
+    // (the two most recent windows of the app toggle). This suite runs on the user's windows: the
+    // toggle is only checked when the first tap lands in an app with another window, and the line
+    // says when it was not (e2e_spaces a and c check it on scratch windows).
     let first = after;
     option_down();
     tab();
@@ -136,14 +198,33 @@ fn main() {
     sleep(Duration::from_millis(700));
     let second = front_wid();
     let second_commit = last_commit_wid();
+    let (rule2, detail2, cur2, siblings2) = quick_tap_rule(second_commit);
     option_down();
     tab();
     option_up();
     sleep(Duration::from_millis(700));
     let third = front_wid();
-    let ok = first.is_some() && second.is_some() && second == second_commit && second != first && third == first;
+    let third_commit = last_commit_wid();
+    let (rule3, detail3, _, _) = quick_tap_rule(third_commit);
+    let toggle = !siblings2 || third == first;
+    let toggle_note = if siblings2 {
+        (third == first).to_string()
+    } else {
+        "not checked (tap1's app has no other window; e2e_spaces a and c check the toggle)".to_string()
+    };
+    let ok = first.is_some()
+        && cur2 == first
+        && second.is_some()
+        && second == second_commit
+        && second != first
+        && rule2
+        && third == third_commit
+        && rule3
+        && toggle;
     pass &= ok;
-    report(format!("CHECK MRU toggle: tap1={first:?} tap2={second:?} tap3={third:?} -> {ok}"));
+    report(format!(
+        "CHECK next window, same app first: tap1={first:?} tap2={second:?} [{detail2}] tap3={third:?} [{detail3}] toggle within the app={toggle_note} -> {ok}"
+    ));
 
     // 3. Hold: Option+Tab, wait for panel, Tab twice, screenshot, release.
     let n0 = commit_count();

@@ -5,8 +5,9 @@
 //!  A) the window opens from the status menu ("Settings…"): ZTab becomes the active app and the
 //!     window is in front;
 //!  B) the window behaves like any window in the switcher: with it key, ⌥Tab lists it as the
-//!     current window and preselects the previous one (scratch Finder window A); a quick ⌥Tab
-//!     goes to A, a second one back to the Settings window;
+//!     current window and preselects the next app's most recent window (scratch Finder window A;
+//!     the Settings window is ZTab's only window); a quick ⌥Tab goes to A; from A, the Settings
+//!     window comes right after all of Finder's windows, and stepping there switches back to it;
 //!  C) show delay: the slider set to 0 ms (mouse click at its left end) shows the panel at once,
 //!     300 ms (right end) shows it after 300 ms and not for a 200 ms hold;
 //!  D) recorder: while it captures, ⌥Tab does not open the switcher (it is recorded instead); a
@@ -14,7 +15,8 @@
 //!  E) the new shortcut: with A in front, holding ⌃F18 opens the switcher and F18 / Esc never
 //!     reach A (a listen-only session tap downstream of ZTab's sees no F18 or Esc); the old ⌥Tab
 //!     no longer opens it (it passes through to A, a scratch Finder window, where it is inert);
-//!     a quick ⌃F18 (⌃ released) switches to the Settings window, a second one back to A;
+//!     stepping with ⌃F18 switches to the Settings window, and a quick ⌃F18 (⌃ released) from it
+//!     back to A;
 //!  F) "Restore defaults": ⌥Tab / ⌥` / 120 ms again (titles, label, file); ⌥Tab opens the
 //!     switcher, ⌃F18 does not;
 //!  G) start at login in the isolated mode: the checkbox writes `<dir>/LaunchAgents/
@@ -495,6 +497,44 @@ fn foreign_since(t: f64) -> Vec<String> {
     FOREIGN.lock().map(|v| v.iter().filter(|(ts, ..)| *ts >= t).map(|(ts, ty, c)| format!("{ts:.3}:{ty}:{c:#x}")).collect()).unwrap_or_default()
 }
 
+/// An `open:` line's preselected index (`selected=`) and the switcher's window order (`order=`).
+fn open_order(line: &str) -> (Option<usize>, Vec<u32>) {
+    let sel = line.split(" selected=").nth(1).and_then(|r| r.split(' ').next()?.parse().ok());
+    let order = line
+        .split(" order=")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .map(|r| r.split(',').filter_map(|w| w.parse().ok()).collect())
+        .unwrap_or_default();
+    (sel, order)
+}
+
+/// Owner pids of windows (CoreGraphics), for checking the switcher's app grouping.
+fn owner_pids(wids: &[u32]) -> std::collections::HashMap<u32, i32> {
+    windows::cg_describe(wids).iter().filter_map(|d| windows::parse_cg(d)).map(|f| (f.0, f.1)).collect()
+}
+
+/// Switch to `target` by stepping: hold the opener, then press its key until the selection is on
+/// `target`'s tile (by the order ZTab logged for the session), and release. Other windows are only
+/// selected on the way, never switched to: if `target` is not after the preselected tile, the
+/// session is cancelled. Returns (commits, the session's window order, `target`'s index in it).
+fn step_to(hold_key: u16, hold_flag: CGEventFlags, code: u16, target: u32) -> (Vec<u32>, Vec<u32>, Option<usize>) {
+    let t = now();
+    key(hold_key, true, hold_flag);
+    press_key(code, hold_flag);
+    let open = wait_for(1.5, || lines_with(t, "open: ").into_iter().next());
+    let (sel, order) = open.as_deref().map(open_order).unwrap_or((None, Vec::new()));
+    let idx = order.iter().position(|w| *w == target);
+    match (sel, idx) {
+        (Some(s), Some(i)) if i >= s => (s..i).for_each(|_| press_key(code, hold_flag)),
+        _ => press_key(ESC, hold_flag),
+    }
+    sleep(Duration::from_millis(150));
+    key(hold_key, false, CGEventFlags::empty());
+    sleep(Duration::from_millis(700));
+    (commits_since(t), order, idx)
+}
+
 /// A quick tap of the opener (hold modifier released right away): returns the commits logged.
 fn quick_tap(hold_key: u16, hold_flag: CGEventFlags, code: u16) -> Vec<u32> {
     let t = now();
@@ -629,19 +669,29 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
     let mru_first: Option<u32> = open_s.split("mru=").nth(1).and_then(|m| m.split([',', ' ']).next()?.parse().ok());
     let selected: Option<u32> = open_s.split(" wid=").nth(1).and_then(|m| m.split(' ').next()?.parse().ok());
     let listed = shown.as_deref().is_some_and(|l| l.contains(&format!("tiles={sw}:")) || l.contains(&format!(";{sw}:")));
+    // The Settings window is ZTab's only window: the window after it is the next app's most
+    // recent one, A.
     out.check(
-        "B/listed as the current window, previous one preselected",
+        "B/listed as the current window, the next app's most recent window (A) preselected",
         open_s.contains("current=Some(") && mru_first == Some(sw) && selected == Some(a) && listed,
         format!("mru_first={mru_first:?} selected={selected:?} listed={listed} open={:?}", open_s.chars().take(220).collect::<String>()),
     );
     let c1 = quick_tap(OPTION, OPT, TAB);
     let f1 = wait_for(2.0, || (top_any().map(|x| x.0) == Some(a)).then_some(()));
-    let c2 = quick_tap(OPTION, OPT, TAB);
+    // Back from A: Finder's other windows (the user's own, if any) come first, then ZTab's
+    // Settings window, the next app's most recent window. Step to it.
+    let (c2, order, idx) = step_to(OPTION, OPT, TAB, sw);
     let f2 = wait_for(2.0, || (top_any().map(|x| x.0) == Some(sw) && frontmost_pid() == Some(pid)).then_some(()));
+    let pids = owner_pids(&order);
+    let finder_first = pids.contains_key(&a) && idx.is_some_and(|i| i >= 1 && order[..i].iter().all(|w| pids.get(w) == pids.get(&a)));
     out.check(
-        "B/quick ⌥Tab goes to A, a second one back to the Settings window",
-        c1 == vec![a] && f1.is_some() && c2 == vec![sw] && f2.is_some(),
-        format!("commits {c1:?} then {c2:?}; front after: {:?}, frontmost pid {:?}", top_any(), frontmost_pid()),
+        "B/quick ⌥Tab goes to A; the Settings window comes right after all of Finder's windows",
+        c1 == vec![a] && f1.is_some() && order.first() == Some(&a) && finder_first && c2 == vec![sw] && f2.is_some(),
+        format!(
+            "commits {c1:?} then {c2:?}; Settings window at index {idx:?} of {order:?} (all before it Finder's: {finder_first}); front after: {:?}, frontmost pid {:?}",
+            top_any(),
+            frontmost_pid()
+        ),
     );
     if f2.is_none() {
         return;
@@ -755,14 +805,16 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
         !opened && passed >= 2 && top_any().map(|x| x.0) == Some(a),
         format!("opened={opened} tab_events_at_session={passed} front={:?}", top_any()),
     );
-    let c1 = quick_tap(CONTROL, CTRL, F18);
+    // To the Settings window by stepping with F18 (Finder's other windows come first), then a
+    // quick ⌃F18 from it (ZTab's only window) goes to the next app's most recent window, A.
+    let (c1, _, idx) = step_to(CONTROL, CTRL, F18, sw);
     let f1 = wait_for(2.0, || (top_any().map(|x| x.0) == Some(sw) && frontmost_pid() == Some(pid)).then_some(()));
     let c2 = quick_tap(CONTROL, CTRL, F18);
     let f2 = wait_for(2.0, || (top_any().map(|x| x.0) == Some(a)).then_some(()));
     out.check(
-        "E/quick ⌃F18 (⌃ released) switches to the Settings window and back to A",
+        "E/⌃F18 steps to the Settings window; a quick ⌃F18 (⌃ released) goes back to A",
         c1 == vec![sw] && f1.is_some() && c2 == vec![a] && f2.is_some(),
-        format!("commits {c1:?} then {c2:?}; front {:?}", top_any()),
+        format!("commits {c1:?} (Settings window at index {idx:?}) then {c2:?}; front {:?}", top_any()),
     );
 
     // F) Restore defaults (AXPress works with the window in the background).
@@ -831,7 +883,7 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
     );
 
     // H) Close the window while it is key: the focus goes back to A.
-    let c = quick_tap(OPTION, OPT, TAB);
+    let (c, _, _) = step_to(OPTION, OPT, TAB, sw);
     let key = wait_for(2.0, || (top_any().map(|x| x.0) == Some(sw) && frontmost_pid() == Some(pid)).then_some(()));
     if key.is_none() {
         out.check("H/Settings window in front before closing", false, format!("commits {c:?} front {:?}", top_any()));
@@ -844,7 +896,7 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
     let back = wait_for(2.0, || (top_any().map(|x| x.0) == Some(a) && frontmost_pid() != Some(pid)).then_some(()));
     let logged = lines_with(t, "settings window closed: focusing");
     out.check(
-        "H/closing it gives the focus back to the previous window",
+        "H/closing it gives the focus back to the most recent window (A)",
         pressed == Some(AXError::Success) && gone.is_some() && back.is_some() && logged.iter().any(|l| l.contains(&format!("wid={a} "))),
         format!("press={pressed:?} gone={} front={:?} frontmost_pid={:?} log={logged:?}", gone.is_some(), top_any(), frontmost_pid()),
     );

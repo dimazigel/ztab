@@ -3,8 +3,13 @@
 //!     switches to that window;
 //!  2. a minimized window (scratch Finder window) is restored and focused when its tile is clicked;
 //!  3. a window of a hidden app (scratch TextEdit document) is unhidden and focused;
-//!  4. Shift+Option+Tab quick tap goes to the least recently used window;
-//!  5. Option+` (same app) stays inside the frontmost app.
+//!  4. Shift+Option+Tab quick tap goes one step back: the last window of the switcher's order
+//!     (with the user's windows, where that order and the MRU order may end alike);
+//!     4b. Shift+Option+` from a current window, in a scratch layout where the two orders end
+//!     differently: three scratch Finder windows, the middle one minimized, must preselect and
+//!     switch to the minimized one (the last of the order), not the least recently used one;
+//!  5. Option+` (same app) stays inside the frontmost app and goes to its next window (two scratch
+//!     Finder windows: same-2 -> same-1 -> same-2).
 //! Usage: `open -W -n -g <bundle> --args <out.txt> <scratch-dir>`.
 
 #[path = "../windows.rs"]
@@ -27,6 +32,7 @@ const OPTION: u16 = 0x3A;
 const SHIFT: u16 = 0x38;
 const TAB: u16 = 0x30;
 const GRAVE: u16 = 0x32;
+const ESC: u16 = 0x35;
 
 thread_local! {
     static SRC: CFRetained<CGEventSource> = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
@@ -67,6 +73,9 @@ fn ztab_log() -> String {
 fn commit_count() -> usize {
     ztab_log().matches("commit: wid=").count()
 }
+fn open_lines() -> Vec<String> {
+    ztab_log().lines().filter(|l| l.contains("] open: ")).map(str::to_string).collect()
+}
 fn last_commit_wid() -> Option<u32> {
     let log = ztab_log();
     let line = log.lines().rev().find(|l| l.contains("commit: wid="))?;
@@ -101,6 +110,42 @@ fn front_wid() -> Option<u32> {
 }
 fn find_win(wid: u32) -> Option<windows::WinInfo> {
     windows::list_windows().into_iter().find(|w| w.wid == wid)
+}
+/// A list field of the last `open:` line (`order=` / `mru=`).
+fn open_list(line: &str, key: &str) -> Vec<u32> {
+    line.split(key)
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .map(|r| r.split(',').filter_map(|w| w.parse().ok()).collect())
+        .unwrap_or_default()
+}
+/// Whether `order` lists each app's windows together (owner pids from CoreGraphics; windows it
+/// does not know any more are ignored).
+fn grouped_by_app(order: &[u32]) -> bool {
+    let pids: std::collections::HashMap<u32, i32> =
+        windows::cg_describe(order).iter().filter_map(|d| windows::parse_cg(d)).map(|f| (f.0, f.1)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut last = None;
+    for p in order.iter().filter_map(|w| pids.get(w)) {
+        if last != Some(*p) && !seen.insert(*p) {
+            return false;
+        }
+        last = Some(*p);
+    }
+    true
+}
+/// Wait (up to `secs`) for `f` to return something.
+fn wait_for<T>(secs: f64, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= end {
+            return None;
+        }
+        let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.1, false);
+    }
 }
 fn osa(script: &str) -> String {
     let o = Command::new("osascript").args(["-e", script]).output().unwrap();
@@ -253,9 +298,9 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     sleep(Duration::from_millis(800));
 
-    // 4. Shift+Option+Tab quick tap: the least recently used window, i.e. the tail of the MRU
-    // order ZTab logs on its `open:` line. It must not be one of the windows this suite just
-    // used (the MRU head), and focus must land on it.
+    // 4. Shift+Option+Tab quick tap: one step back from the current window, i.e. the last window
+    // of the switcher's order (`order=` on ZTab's `open:` line: the least recently used app's
+    // last window). The order must keep each app's windows together, and focus must land there.
     let n0 = commit_count();
     option_down();
     key(SHIFT, true, CGEventFlags::MaskAlternate | CGEventFlags::MaskShift);
@@ -266,43 +311,144 @@ fn main() {
     sleep(Duration::from_millis(900));
     let committed = (commit_count() > n0).then(last_commit_wid).flatten();
     let opened = ztab_log().lines().rev().find(|l| l.contains("open:")).unwrap_or("").to_string();
-    let mru: Vec<u32> = opened
-        .split(" mru=")
-        .nth(1)
-        .and_then(|r| r.split_whitespace().next())
-        .map(|r| r.split(',').filter_map(|w| w.parse().ok()).collect())
-        .unwrap_or_default();
-    let expected = mru.last().copied();
-    let head: Vec<u32> = mru.iter().take(2).copied().collect();
+    let order = open_list(&opened, " order=");
+    let mru_last = open_list(&opened, " mru=").last().copied();
+    let expected = order.last().copied();
+    let grouped = grouped_by_app(&order);
     let front = front_wid();
     report(
-        mru.len() >= 3 && opened.contains("reverse=true") && committed.is_some() && committed == expected && !head.contains(&expected.unwrap_or(0)) && front == committed,
-        format!("shift+option+tab: mru_len={} expected least-recent={expected:?} committed={committed:?} front={front:?}", mru.len()),
+        order.len() >= 3 && opened.contains("reverse=true") && grouped && committed.is_some() && committed == expected && front == committed,
+        format!(
+            "shift+option+tab: {} windows, grouped by app={grouped}, expected the last one={expected:?} committed={committed:?} front={front:?} \
+             (the MRU order ends with {mru_last:?}: tells the rule from the least recently used window={})",
+            order.len(),
+            mru_last != expected
+        ),
     );
 
-    // 5. Option+` with Finder frontmost: only Finder windows, switch stays in Finder. The suite
-    // opens two scratch Finder windows itself (it must not depend on the user having one open).
+    // 4b. Shift+Option+` from a current window, where the switcher's order and the MRU order end
+    // differently. Scratch Finder windows rev-a, rev-b, rev-c, each activated with `open -a` and
+    // kept in front past ZTab's settle time (MRU rev-c, rev-b, rev-a), then rev-b minimized while
+    // rev-c stays in front. Finder's order lists its minimized windows last (rev-c, rev-a, the
+    // user's open Finder windows, rev-b), while the MRU order ends with rev-a or an older Finder
+    // window of the user's: one step back must be rev-b. The session is held and released only
+    // when rev-b is preselected (Esc otherwise), so it never switches to a window of the user's;
+    // it is skipped when the user has a minimized Finder window (that one would come after rev-b).
+    let user_min: Vec<u32> = windows::list_windows().into_iter().filter(|w| w.app_name == "Finder" && w.minimized).map(|w| w.wid).collect();
+    let rev_names = ["ztab-e2e-rev-a", "ztab-e2e-rev-b", "ztab-e2e-rev-c"];
+    if !user_min.is_empty() {
+        report(true, format!("shift+option+` from a current window: SKIPPED, the user has minimized Finder windows {user_min:?}"));
+    } else {
+        let mut rev: Vec<Option<u32>> = Vec::new();
+        for name in rev_names {
+            let d = format!("{scratch}/{name}");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = Command::new("open").args(["-a", "Finder", &d]).status();
+            let w = wait_for(8.0, || windows::list_windows().into_iter().find(|w| w.app_name == "Finder" && w.title == name));
+            if let Some(w) = &w {
+                wait_for(4.0, || (front_wid() == Some(w.wid)).then_some(()));
+            }
+            sleep(Duration::from_millis(900));
+            rev.push(w.map(|w| w.wid));
+        }
+        match rev[..] {
+            [Some(ra), Some(rb), Some(rc)] => {
+                osa("tell application \"Finder\" to set collapsed of window \"ztab-e2e-rev-b\" to true");
+                let min = wait_for(4.0, || find_win(rb).filter(|w| w.minimized).map(|_| ())).is_some();
+                sleep(Duration::from_millis(900));
+                let before = front_wid();
+                let (n_open, n0) = (open_lines().len(), commit_count());
+                let shifted = CGEventFlags::MaskAlternate | CGEventFlags::MaskShift;
+                option_down();
+                key(SHIFT, true, shifted);
+                key(GRAVE, true, shifted);
+                key(GRAVE, false, shifted);
+                let opened = wait_for(1.5, || {
+                    let v = open_lines();
+                    (v.len() > n_open).then(|| v[n_open].clone())
+                })
+                .unwrap_or_default();
+                let sel = opened.split(" wid=").nth(1).and_then(|r| r.split(' ').next()?.parse::<u32>().ok());
+                let go = sel == Some(rb);
+                if !go {
+                    key(ESC, true, shifted);
+                    key(ESC, false, shifted);
+                }
+                key(SHIFT, false, CGEventFlags::MaskAlternate);
+                option_up();
+                let front = wait_for(3.0, || (front_wid() == Some(rb)).then_some(rb)).or_else(front_wid);
+                sleep(Duration::from_millis(300));
+                let committed = (commit_count() > n0).then(last_commit_wid).flatten();
+                let restored = find_win(rb).map(|w| !w.minimized);
+                let order = open_list(&opened, " order=");
+                let mru = open_list(&opened, " mru=");
+                let layout_ok = opened.contains("current=Some(0)")
+                    && opened.contains("reverse=true")
+                    && opened.contains("same_app=true")
+                    && order.first() == Some(&rc)
+                    && order.get(1) == Some(&ra)
+                    && order.last() == Some(&rb);
+                let tells_apart = mru.last().is_some() && mru.last() != order.last();
+                report(
+                    min && before == Some(rc) && layout_ok && tells_apart && go && committed == Some(rb) && front == Some(rb) && restored == Some(true),
+                    format!(
+                        "shift+option+` from a current window: rev-a={ra} rev-b={rb} (minimized={min}) rev-c={rc} before={before:?} \
+                         order={order:?} mru={mru:?} (current first, rev-b last={layout_ok}; MRU ends elsewhere={tells_apart}) \
+                         preselected={sel:?} committed={committed:?} front={front:?} rev-b restored={restored:?}"
+                    ),
+                );
+            }
+            _ => report(false, format!("shift+option+` from a current window: scratch Finder windows did not appear: {rev:?}")),
+        }
+        for name in rev_names {
+            osa(&format!("tell application \"Finder\" to close window \"{name}\""));
+            let _ = std::fs::remove_dir_all(format!("{scratch}/{name}"));
+        }
+        sleep(Duration::from_millis(500));
+    }
+
+    // 5. Option+` with Finder frontmost: only Finder windows, and the same app's next window. The
+    // suite opens two scratch Finder windows itself (it must not depend on the user having one
+    // open), each activated with `open -a` and kept in front past ZTab's settle time so both are
+    // in its MRU history: from same-2, ⌥` goes to same-1, a second ⌥` back to same-2.
     let same_dirs: Vec<String> = ["ztab-e2e-same-1", "ztab-e2e-same-2"].iter().map(|n| format!("{scratch}/{n}")).collect();
+    let mut same: Vec<Option<u32>> = Vec::new();
     for d in &same_dirs {
         let _ = std::fs::create_dir_all(d);
-        osa(&format!("tell application \"Finder\" to make new Finder window to (POSIX file \"{d}\" as alias)"));
-        sleep(Duration::from_millis(400));
+        let name = std::path::Path::new(d).file_name().unwrap().to_string_lossy().to_string();
+        let _ = Command::new("open").args(["-a", "Finder", d]).status();
+        let w = wait_for(8.0, || windows::list_windows().into_iter().find(|w| w.app_name == "Finder" && w.title == name));
+        if let Some(w) = &w {
+            wait_for(4.0, || (front_wid() == Some(w.wid)).then_some(()));
+        }
+        sleep(Duration::from_millis(900));
+        same.push(w.map(|w| w.wid));
     }
-    osa("tell application \"Finder\" to activate");
-    sleep(Duration::from_millis(1000));
     let finder: Vec<u32> = windows::list_windows().into_iter().filter(|w| w.app_name == "Finder").map(|w| w.wid).collect();
     let before = front_wid();
-    let n0 = commit_count();
-    option_down();
-    key(GRAVE, true, CGEventFlags::MaskAlternate);
-    key(GRAVE, false, CGEventFlags::MaskAlternate);
-    option_up();
-    sleep(Duration::from_millis(900));
-    let committed = (commit_count() > n0).then(last_commit_wid).flatten();
-    let opened = ztab_log().lines().rev().find(|l| l.contains("open:")).unwrap_or("").to_string();
+    let grave = || {
+        let n0 = commit_count();
+        option_down();
+        key(GRAVE, true, CGEventFlags::MaskAlternate);
+        key(GRAVE, false, CGEventFlags::MaskAlternate);
+        option_up();
+        sleep(Duration::from_millis(900));
+        let committed = (commit_count() > n0).then(last_commit_wid).flatten();
+        let opened = ztab_log().lines().rev().find(|l| l.contains("open:")).unwrap_or("").to_string();
+        (committed, opened, front_wid())
+    };
+    let (c1, opened, f1) = grave();
     let count_ok = opened.contains(&format!("open: {} windows", finder.len())) && opened.contains("same_app=true");
-    let ok = finder.len() >= 2 && count_ok && committed.map(|c| finder.contains(&c)).unwrap_or(false) && committed != before;
-    report(ok, format!("option+` in Finder: finder_windows={} before={before:?} committed={committed:?} log_ok={count_ok}", finder.len()));
+    let (c2, _, f2) = grave();
+    let (s1, s2) = (same[0], same[1]);
+    let ok = s1.is_some() && s2.is_some() && before == s2 && count_ok && c1 == s1 && f1 == s1 && c2 == s2 && f2 == s2;
+    report(
+        ok,
+        format!(
+            "option+` in Finder: finder_windows={} same-1={s1:?} same-2={s2:?} before={before:?} tap1 committed={c1:?} front={f1:?}; tap2 committed={c2:?} front={f2:?} log_ok={count_ok}",
+            finder.len()
+        ),
+    );
     for d in &same_dirs {
         let name = std::path::Path::new(d).file_name().unwrap().to_string_lossy().to_string();
         osa(&format!("tell application \"Finder\" to close window \"{name}\""));

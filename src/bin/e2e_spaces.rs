@@ -2,28 +2,37 @@
 //! screen, and ZTab's log at ~/Library/Logs/ztab.log). Uses only scratch windows it creates (Finder
 //! windows on folders under the scratch dir, TextEdit documents in it) and cleans them up.
 //!
-//!  a) full-screen Space + MRU: scratch doc W full screen; a quick ⌥Tab goes back to the previous
-//!     window P on the desktop Space, a second one returns to W (MRU across Spaces), then clicking
-//!     P's tile goes back again; W leaves full screen and is closed;
+//!  a) full-screen Space: scratch Finder window Q, then scratch docs P and W (TextEdit), W full
+//!     screen; a quick ⌥Tab goes to the app's other window P on the desktop Space, a second one
+//!     returns to W (same app, across Spaces); clicking Q's tile switches from full-screen W to
+//!     another app's window on the desktop Space, clicking W's tile from Q back into W's Space,
+//!     then clicking P's tile goes to P; W leaves full screen, W, P and Q are closed;
 //!  b) hung app: TextEdit (only if this suite launched it) with one normal and one minimized
 //!     document is SIGSTOPped; holding ⌥Tab must show the panel within 250 ms with `open:` under
 //!     30 ms and both documents listed; Esc; SIGCONT (always); no main-thread stall logged; and a
 //!     fresh thumbnail of the normal document (its cached one is older than ZTab's 3 s
 //!     show-capture age by then) must land while TextEdit is stopped (`thumbs_landed` of the
 //!     `panel hidden` line);
-//!  c) external MRU: windows activated with `open -a` (Finder A, TextEdit T, Finder A again); a quick
-//!     ⌥Tab goes to T, another one back to A;
+//!  c) same app first, MRU from activations outside ZTab: windows activated with `open -a` (Finder
+//!     A1, Finder A2, TextEdit T, Finder A1 again; ZTab's logged MRU head must be A1, T, A2); a
+//!     quick ⌥Tab goes to A2 (the same app's next window), not T, another one back to A1; holding
+//!     ⌥ and stepping past every Finder window lands on T (the next app comes after all of the
+//!     app's windows);
 //!  d) minimized thumbnail: a scratch Finder window that was focused, left (FocusLeft capture) and
 //!     minimized has a thumbnail in the switcher (`t=1`);
 //!  e) secure input: while this process holds secure input, ZTab logs it and its menu shows the
 //!     warning; both go away when it is released;
-//!  f) busy app raise: TextEdit (only if this suite launched it) is SIGSTOPped; holding ⌥, Tab +
-//!     Return switches to its document A, and Tab + Return again, while A's raise is blocked in
-//!     the stopped app, back to a scratch Finder window B. B must be fronted and raised within 200 ms (its raise
-//!     runs on Finder's own raise thread), and after SIGCONT, when TextEdit applies A's queued
-//!     raise, B must end up in front (ZTab re-fronts it if A came out on top).
+//!  f) busy app raise: TextEdit (only if this suite launched it) is SIGSTOPped; holding ⌥, Tab
+//!     (stepping past any other Finder windows, by the order ZTab logged) + Return switches to its
+//!     document A, and Tab + Return again, while A's raise is blocked in the stopped app, back to a
+//!     scratch Finder window B. B must be fronted and raised within 200 ms (its raise runs on
+//!     Finder's own raise thread), and after SIGCONT, when TextEdit applies A's queued raise, B
+//!     must end up in front (ZTab re-fronts it if A came out on top);
+//!  g) minimized windows after the app's open ones: Finder F3, F1, F2 (activated with `open -a`),
+//!     F2 minimized, F1 re-fronted (MRU F1, F2, F3); a quick ⌥Tab goes to F3, not F2 (the logged
+//!     order lists F3 before F2 and F2 before the next app), and F2 stays minimized.
 //!
-//! Usage: `open -W -n -g <bundle> --args <out.txt> <scratch-dir> [only=abcdef]`.
+//! Usage: `open -W -n -g <bundle> --args <out.txt> <scratch-dir> [only=abcdefg]`.
 
 #[path = "../windows.rs"]
 #[allow(dead_code)]
@@ -172,6 +181,34 @@ fn panel_since(t: f64) -> Option<Panel> {
 
 fn num_after(line: &str, key: &str) -> Option<f64> {
     line.split(key).nth(1)?.split(|c: char| c != '.' && !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// A session's `open:` line: the preselected index, the switcher's window order (`order=`) and
+/// the MRU order (`mru=`).
+struct Opened {
+    sel: Option<usize>,
+    order: Vec<u32>,
+    mru: Vec<u32>,
+    line: String,
+}
+
+fn opened_since(t: f64) -> Option<Opened> {
+    let (_, line) = first_line_since(t, "open:")?;
+    let list = |key: &str| -> Vec<u32> {
+        line.split(key)
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .map(|r| r.split(',').filter_map(|w| w.parse().ok()).collect())
+            .unwrap_or_default()
+    };
+    let sel = line.split(" selected=").nth(1).and_then(|r| r.split(' ').next()?.parse().ok());
+    let (order, mru) = (list(" order="), list(" mru="));
+    Some(Opened { sel, order, mru, line })
+}
+
+/// Owner pids of windows (CoreGraphics knows every window, on any Space), for the app grouping.
+fn owner_pids(wids: &[u32]) -> std::collections::HashMap<u32, i32> {
+    windows::cg_describe(wids).iter().filter_map(|d| windows::parse_cg(d)).map(|f| (f.0, f.1)).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -325,13 +362,19 @@ fn wait_front(wid: u32, timeout: f64) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// a) full-screen Space + MRU
+// a) full-screen Space: same app and another app
 // ---------------------------------------------------------------------------------------------
 
-/// P (scratch Finder window) then W (scratch document), both on the primary display; W goes
-/// full screen. Returns (P, W, W's AX element, W is full screen and in front).
-fn setup_a(cx: &Ctx, dir: &str, doc: &str, out: &mut Out) -> Result<(u32, u32, CFRetained<AXUIElement>, bool), String> {
-    let p = open_finder(dir, &[]).ok_or("scratch Finder window P did not appear")?;
+/// Q (a scratch Finder window), then P and W (two scratch documents of one app, TextEdit), all on
+/// the primary display; W goes full screen. Returns (Q, P, W, W's AX element, W is full screen and
+/// in front).
+fn setup_a(cx: &Ctx, dir_q: &str, doc_p: &str, doc: &str, out: &mut Out) -> Result<(u32, u32, u32, CFRetained<AXUIElement>, bool), String> {
+    let q = open_finder(dir_q, &[]).ok_or("scratch Finder window Q did not appear")?;
+    if let Some(el) = &q.ax {
+        ax_set_pos(el, cx.primary.0 + 120.0, cx.primary.1 + 100.0);
+    }
+    pump(1.3);
+    let p = open_doc(doc_p).ok_or("scratch TextEdit window P did not appear")?;
     if let Some(el) = &p.ax {
         ax_set_pos(el, cx.primary.0 + 200.0, cx.primary.1 + 150.0);
     }
@@ -343,31 +386,53 @@ fn setup_a(cx: &Ctx, dir: &str, doc: &str, out: &mut Out) -> Result<(u32, u32, C
     let e = ax_set_bool(&el, "AXFullScreen", true);
     let fs = wait_for(6.0, || (ax_bool(&el, "AXFullScreen") == Some(true) && front_wid() == Some(w.wid)).then_some(()));
     pump(1.5);
-    out.note(format!("(a) P={} W={} AXFullScreen set -> {e:?}, full screen + front: {}", p.wid, w.wid, fs.is_some()));
-    Ok((p.wid, w.wid, el, fs.is_some()))
+    out.note(format!("(a) Q={} P={} W={} AXFullScreen set -> {e:?}, full screen + front: {}", q.wid, p.wid, w.wid, fs.is_some()));
+    Ok((q.wid, p.wid, w.wid, el, fs.is_some()))
+}
+
+/// Hold ⌥Tab, click the tile of `target` once the panel shows, release ⌥ and wait for `target` to
+/// be in front. Returns (tile found, `also` listed, commits since, front window).
+fn click_tile(target: u32, also: u32) -> (bool, bool, Vec<u32>, Option<u32>) {
+    let t = now_secs();
+    option_down();
+    tab();
+    let panel = wait_for(1.5, || panel_since(t));
+    let pt = panel.as_ref().and_then(|pl| pl.tiles.iter().find(|(id, ..)| *id == target).map(|(_, pt, _)| *pt));
+    let listed = panel.as_ref().is_some_and(|pl| pl.tiles.iter().any(|(id, ..)| *id == also));
+    if let Some(pt) = pt {
+        click(pt, CGEventFlags::MaskAlternate);
+    }
+    pump(0.9);
+    option_up();
+    let front = wait_front(target, 5.0);
+    pump(0.5);
+    (pt.is_some(), listed, commits_since(t), front)
 }
 
 fn suite_a(cx: &Ctx, out: &mut Out) {
-    let dir = format!("{}/ztab-sp-P", cx.scratch);
+    let dir_q = format!("{}/ztab-sp-Q", cx.scratch);
+    let doc_p = format!("{}/ztab-sp-P.txt", cx.scratch);
     let doc = format!("{}/ztab-sp-W.txt", cx.scratch);
     let mut w_el: Option<CFRetained<AXUIElement>> = None;
-    match setup_a(cx, &dir, &doc, out) {
+    match setup_a(cx, &dir_q, &doc_p, &doc, out) {
         Err(e) => out.check("a/setup", false, e),
-        Ok((p, w, el, fs)) => {
+        Ok((q, p, w, el, fs)) => {
             w_el = Some(el.clone());
             out.check("a/full screen", fs, format!("W={w} AXFullScreen={:?} front={:?}", ax_bool(&el, "AXFullScreen"), front_wid()));
 
-            // 1. Quick ⌥Tab from full-screen W: the previous window P on the desktop Space.
+            // 1. Quick ⌥Tab from full-screen W: the app's next window, P on the desktop Space
+            // (its most recent other window: the same app's windows come before other apps').
             let t1 = now_secs();
             quick_tap();
             let front = wait_front(p, 5.0);
             pump(0.8);
             let commits = commits_since(t1);
             let w_visible = onscreen(w);
+            let head = opened_since(t1).map(|o| o.order.into_iter().take(2).collect::<Vec<_>>());
             out.check(
-                "a/quick tap to desktop P",
-                commits == vec![p] && front == Some(p) && !w_visible,
-                format!("commits={commits:?} front={front:?} W on screen={w_visible}"),
+                "a/quick tap to the app's other window P on the desktop Space",
+                commits == vec![p] && front == Some(p) && !w_visible && head == Some(vec![w, p]),
+                format!("commits={commits:?} front={front:?} W on screen={w_visible} order head={head:?}"),
             );
 
             // 2. Quick ⌥Tab again: back to W on its full-screen Space.
@@ -383,25 +448,32 @@ fn suite_a(cx: &Ctx, out: &mut Out) {
                 format!("commits={commits:?} front={front:?} W on screen={} AXFullScreen={fs_now:?}", onscreen(w)),
             );
 
-            // 3. Hold ⌥Tab and click P's tile.
-            let t3 = now_secs();
-            option_down();
-            tab();
-            let panel = wait_for(1.5, || panel_since(t3));
-            let target = panel.as_ref().and_then(|pl| pl.tiles.iter().find(|(id, ..)| *id == p).map(|(_, pt, _)| *pt));
-            let w_listed = panel.as_ref().is_some_and(|pl| pl.tiles.iter().any(|(id, ..)| *id == w));
-            if let Some(pt) = target {
-                click(pt, CGEventFlags::MaskAlternate);
-            }
-            pump(0.9);
-            option_up();
-            let front = wait_front(p, 5.0);
-            pump(0.5);
-            let commits = commits_since(t3);
+            // 3. Another app's window: hold ⌥Tab in full-screen W and click Q's tile (Finder, on
+            // the desktop Space). Clicking, not stepping: a quick tap from Q could land on one of
+            // the user's own Finder windows.
+            let (found, w_listed, commits, front) = click_tile(q, w);
+            let w_visible = onscreen(w);
+            out.check(
+                "a/click another app's window Q (desktop Space) from full-screen W",
+                found && w_listed && commits == vec![q] && front == Some(q) && onscreen(q) && !w_visible,
+                format!("tile found={found} W listed={w_listed} commits={commits:?} front={front:?} Q on screen={} W on screen={w_visible}", onscreen(q)),
+            );
+
+            // 4. And back: from Q, click W's tile (into W's full-screen Space, another app).
+            let (found, q_listed, commits, front) = click_tile(w, q);
+            let fs_now = ax_bool(&el, "AXFullScreen");
+            out.check(
+                "a/click full-screen W's tile from Q (another app)",
+                found && q_listed && commits == vec![w] && front == Some(w) && onscreen(w) && fs_now == Some(true),
+                format!("tile found={found} Q listed={q_listed} commits={commits:?} front={front:?} W on screen={} AXFullScreen={fs_now:?}", onscreen(w)),
+            );
+
+            // 5. Hold ⌥Tab and click P's tile.
+            let (found, w_listed, commits, front) = click_tile(p, w);
             out.check(
                 "a/click P's tile from full-screen W",
-                target.is_some() && w_listed && commits == vec![p] && front == Some(p),
-                format!("tile found={} W listed={w_listed} commits={commits:?} front={front:?}", target.is_some()),
+                found && w_listed && commits == vec![p] && front == Some(p),
+                format!("tile found={found} W listed={w_listed} commits={commits:?} front={front:?}"),
             );
         }
     }
@@ -415,12 +487,14 @@ fn suite_a(cx: &Ctx, out: &mut Out) {
         out.note(format!("(a) cleanup: left full screen: {}", left.is_some()));
     }
     close_doc(&doc);
-    close_finder(&dir);
+    close_doc(&doc_p);
+    close_finder(&dir_q);
     pump(0.5);
     cx.quit_textedit_if_ours();
     pump(1.0);
     let _ = std::fs::remove_file(&doc);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&doc_p);
+    let _ = std::fs::remove_dir_all(&dir_q);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -584,15 +658,30 @@ fn suite_f(cx: &Ctx, out: &mut Out) {
             sleep(Duration::from_millis(800));
             // Two switches in a row, committed with Return while ⌥ stays held (fewer events than
             // two quick taps, so the second one reliably lands while A's raise is blocked): to A,
-            // whose app is stopped so its AX raise blocks, then back to B.
+            // whose app is stopped so its AX raise blocks, then back to B (from A, TextEdit's
+            // only window, the next app's most recent window). B's app (Finder) may have other
+            // windows (the user's own): the switcher lists them before A (same app first), so the
+            // first switch steps to A by the order ZTab logged (only the log is read while
+            // TextEdit is stopped). If A is not after the preselected tile, the session is
+            // cancelled instead (and the check fails).
             let t1 = now_secs();
-            let keys = Instant::now();
             option_down();
             tab();
-            ret();
+            let o1 = wait_for(1.0, || opened_since(t1));
+            let steps = o1.as_ref().and_then(|o| o.order.iter().position(|w| *w == a.wid)?.checked_sub(o.sel?));
+            match steps {
+                Some(n) => (0..n).for_each(|_| tab()),
+                None => esc(),
+            }
+            let keys = Instant::now();
+            if steps.is_some() {
+                ret();
+            }
             let t2 = now_secs();
-            tab();
-            ret();
+            if steps.is_some() {
+                tab();
+                ret();
+            }
             option_up();
             let keys_ms = keys.elapsed().as_secs_f64() * 1000.0;
             sleep(Duration::from_millis(1200));
@@ -625,7 +714,7 @@ fn suite_f(cx: &Ctx, out: &mut Out) {
                     && raised.is_some_and(|ms| ms < 200.0)
                     && front == Some(b.wid),
                 format!(
-                    "SIGSTOP={r} A={} B={} B front before={} keys {keys_ms:.0} ms commits={commits:?} B fronted while A's raise was blocked={overlap} \
+                    "SIGSTOP={r} A={} B={} B front before={} extra Tabs to A={steps:?} keys {keys_ms:.0} ms commits={commits:?} B fronted while A's raise was blocked={overlap} \
                      B fronted after {fronted:?} ms, raised after {raised:?} ms; front after SIGCONT={front:?}",
                     a.wid,
                     b.wid,
@@ -653,48 +742,111 @@ fn suite_f(cx: &Ctx, out: &mut Out) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// c) external MRU
+// c) same app first, with MRU from activations outside ZTab
 // ---------------------------------------------------------------------------------------------
 
 fn suite_c(cx: &Ctx, out: &mut Out) {
-    let dir = format!("{}/ztab-sp-A", cx.scratch);
+    let dir1 = format!("{}/ztab-sp-A1", cx.scratch);
+    let dir2 = format!("{}/ztab-sp-A2", cx.scratch);
     let doc = format!("{}/ztab-sp-T.txt", cx.scratch);
-    let a = open_finder(&dir, &[]);
+    // A1, A2 (Finder), T (TextEdit), each activated with `open -a` and kept in front for longer
+    // than ZTab's 250 ms settle time, so each enters the MRU history.
+    let a1 = open_finder(&dir1, &[]);
+    pump(1.3);
+    let a2 = open_finder(&dir2, &[]);
     pump(1.3);
     let t = open_doc(&doc);
     pump(1.3);
-    match (a, t) {
-        (Some(a), Some(t)) => {
-            // Back to A through `open -a` again: Finder re-fronts the existing window.
-            let _ = Command::new("open").args(["-a", "Finder", &dir]).status();
-            let front = wait_front(a.wid, 4.0);
+    match (a1, a2, t) {
+        (Some(a1), Some(a2), Some(t)) => {
+            // Back to A1 through `open -a` again: Finder re-fronts the existing window. MRU now:
+            // A1, T, A2 (the old rule, "the previous window", would pick T).
+            let _ = Command::new("open").args(["-a", "Finder", &dir1]).status();
+            let front = wait_front(a1.wid, 4.0);
             pump(1.3);
-            out.note(format!("(c) A={} T={} after re-open front={front:?}", a.wid, t.wid));
+            out.note(format!("(c) A1={} A2={} T={} after re-open front={front:?}", a1.wid, a2.wid, t.wid));
+
+            // 1. Quick ⌥Tab from A1: Finder's other window A2, not T (used after A2).
             let t1 = now_secs();
             quick_tap();
-            let f1 = wait_front(t.wid, 4.0);
+            let f1 = wait_front(a2.wid, 4.0);
             pump(0.6);
             let c1 = commits_since(t1);
+            let o1 = opened_since(t1);
+            let mru_head: Option<Vec<u32>> = o1.as_ref().map(|o| o.mru.iter().take(3).copied().collect());
+            let order_head: Option<Vec<u32>> = o1.as_ref().map(|o| o.order.iter().take(2).copied().collect());
+            out.check(
+                "c/quick tap: the same app's next window before a more recent app",
+                front == Some(a1.wid)
+                    && mru_head == Some(vec![a1.wid, t.wid, a2.wid])
+                    && order_head == Some(vec![a1.wid, a2.wid])
+                    && c1 == vec![a2.wid]
+                    && f1 == Some(a2.wid),
+                format!("re-fronted A1={} mru head={mru_head:?} order head={order_head:?} commits={c1:?} front={f1:?}", front == Some(a1.wid)),
+            );
+
+            // 2. Again: back to A1 (repeated quick taps toggle between the app's two windows).
             let t2 = now_secs();
             quick_tap();
-            let f2 = wait_front(a.wid, 4.0);
+            let f2 = wait_front(a1.wid, 4.0);
             pump(0.6);
             let c2 = commits_since(t2);
+            out.check("c/a second quick tap returns to A1", c2 == vec![a1.wid] && f2 == Some(a1.wid), format!("commits={c2:?} front={f2:?}"));
+
+            // 3. Hold ⌥ and step past every Finder window (the user's own ones included, only
+            // selected, never switched to): the next tile is T, the next app's most recent window.
+            // Without T right after Finder's windows the session is cancelled.
+            let t3 = now_secs();
+            option_down();
+            tab();
+            let o3 = wait_for(1.5, || opened_since(t3));
+            let order = o3.as_ref().map(|o| o.order.clone()).unwrap_or_default();
+            let pids = owner_pids(&order);
+            let finder = |w: &u32| pids.get(w) == Some(&a1.pid);
+            let k = order.iter().position(|w| !finder(w));
+            let grouped = k.is_some_and(|k| k >= 2 && order[..k].iter().all(finder) && !order[k..].iter().any(finder));
+            let sel = o3.as_ref().and_then(|o| o.sel);
+            let walk = match (k, sel) {
+                (Some(k), Some(s)) if grouped && order[k] == t.wid && s <= k => Some(k - s),
+                _ => None,
+            };
+            match walk {
+                Some(n) => (0..n).for_each(|_| tab()),
+                None => esc(),
+            }
+            pump(0.3);
+            option_up();
+            let f3 = wait_front(t.wid, 4.0);
+            pump(0.4);
+            let c3 = commits_since(t3);
             out.check(
-                "c/external MRU",
-                front == Some(a.wid) && c1 == vec![t.wid] && f1 == Some(t.wid) && c2 == vec![a.wid] && f2 == Some(a.wid),
-                format!("re-fronted A={} tap1 commits={c1:?} front={f1:?}; tap2 commits={c2:?} front={f2:?}", front == Some(a.wid)),
+                "c/after all of the app's windows comes the next app",
+                grouped && walk.is_some() && c3 == vec![t.wid] && f3 == Some(t.wid),
+                format!(
+                    "Finder windows listed first: {:?} (all grouped={grouped}), next tile={:?} preselected={sel:?} extra Tabs={walk:?} commits={c3:?} front={f3:?}",
+                    k,
+                    k.and_then(|k| order.get(k))
+                ),
             );
+            if walk.is_none() {
+                out.note(format!("(c) open line: {:?}", o3.map(|o| o.line.chars().take(400).collect::<String>())));
+            }
         }
-        (a, t) => out.check("c/external MRU", false, format!("setup failed: A={:?} T={:?}", a.map(|w| w.wid), t.map(|w| w.wid))),
+        (a1, a2, t) => out.check(
+            "c/same app first",
+            false,
+            format!("setup failed: A1={:?} A2={:?} T={:?}", a1.map(|w| w.wid), a2.map(|w| w.wid), t.map(|w| w.wid)),
+        ),
     }
     close_doc(&doc);
-    close_finder(&dir);
+    close_finder(&dir1);
+    close_finder(&dir2);
     pump(0.5);
     cx.quit_textedit_if_ours();
     pump(1.0);
     let _ = std::fs::remove_file(&doc);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir1);
+    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -933,13 +1085,83 @@ fn suite_e(_cx: &Ctx, out: &mut Out) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// g) minimized windows after the app's open ones
+// ---------------------------------------------------------------------------------------------
+
+fn suite_g(cx: &Ctx, out: &mut Out) {
+    let dirs: Vec<String> = ["ztab-sp-F3", "ztab-sp-F1", "ztab-sp-F2"].iter().map(|n| format!("{}/{n}", cx.scratch)).collect();
+    // F3, F1, F2 (Finder), each activated with `open -a` and kept in front past ZTab's settle time.
+    let mut wins = Vec::new();
+    for d in &dirs {
+        wins.push(open_finder(d, &[]));
+        pump(1.3);
+    }
+    match (wins[0].take(), wins[1].take(), wins[2].take()) {
+        (Some(f3), Some(f1), Some(f2)) => {
+            // F2 (in front, the most recent) is minimized, then F1 re-fronted with `open -a`:
+            // MRU F1, F2, F3, so the plain MRU order would put F2 next.
+            let el2 = f2.ax.clone();
+            if let Some(el) = &el2 {
+                ax_set_bool(el, "AXMinimized", true);
+            }
+            let min = wait_for(4.0, || el2.as_ref().and_then(|el| ax_bool(el, "AXMinimized")).filter(|m| *m));
+            pump(1.0);
+            let _ = Command::new("open").args(["-a", "Finder", &dirs[1]]).status();
+            let front = wait_front(f1.wid, 4.0);
+            pump(1.3);
+            out.note(format!("(g) F3={} F1={} F2={} (minimized={}) front={front:?}", f3.wid, f1.wid, f2.wid, min.is_some()));
+            let t1 = now_secs();
+            quick_tap();
+            let f = wait_front(f3.wid, 4.0);
+            pump(0.8);
+            let c = commits_since(t1);
+            let still_min = el2.as_ref().and_then(|el| ax_bool(el, "AXMinimized"));
+            let o = opened_since(t1);
+            let (mru, order) = o.as_ref().map(|o| (o.mru.clone(), o.order.clone())).unwrap_or_default();
+            let pos = |v: &[u32], w: u32| v.iter().position(|x| *x == w);
+            let pids = owner_pids(&order);
+            let next_app = order.iter().position(|w| pids.get(w) != Some(&f1.pid));
+            let mru_ok = matches!((pos(&mru, f2.wid), pos(&mru, f3.wid)), (Some(a), Some(b)) if a < b);
+            let order_ok = order.first() == Some(&f1.wid)
+                && order.get(1) == Some(&f3.wid)
+                && matches!((pos(&order, f3.wid), pos(&order, f2.wid)), (Some(a), Some(b)) if a < b)
+                && pos(&order, f2.wid).is_some_and(|b| next_app.is_none_or(|k| b < k));
+            out.check(
+                "g/quick tap: the app's open window before its more recent minimized one",
+                min.is_some() && front == Some(f1.wid) && mru_ok && order_ok && c == vec![f3.wid] && f == Some(f3.wid) && still_min == Some(true),
+                format!(
+                    "minimized={} re-fronted F1={} F2 before F3 in mru={mru_ok} F3 then F2, both before the next app, in order={order_ok} (first non-Finder at {next_app:?}) commits={c:?} front={f:?} F2 still minimized={still_min:?}",
+                    min.is_some(),
+                    front == Some(f1.wid)
+                ),
+            );
+            if !(mru_ok && order_ok) {
+                out.note(format!("(g) open line: {:?}", o.map(|o| o.line.chars().take(400).collect::<String>())));
+            }
+        }
+        (a, b, c) => out.check(
+            "g/minimized after open",
+            false,
+            format!("setup failed: F3={:?} F1={:?} F2={:?}", a.map(|w| w.wid), b.map(|w| w.wid), c.map(|w| w.wid)),
+        ),
+    }
+    for d in &dirs {
+        close_finder(d);
+    }
+    pump(0.8);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let f = std::fs::File::create(&args[1]).unwrap();
     let mut out = Out { f, pass: true, skipped: Vec::new() };
     let scratch = args.get(2).cloned().unwrap_or_else(|| "/tmp".into());
-    let only = args.iter().find_map(|a| a.strip_prefix("only=")).unwrap_or("abcdef").to_string();
+    let only = args.iter().find_map(|a| a.strip_prefix("only=")).unwrap_or("abcdefg").to_string();
     // Keep App Nap from stretching this background process's sleeps (the key timings matter).
     let _activity = objc2_foundation::NSProcessInfo::processInfo().beginActivityWithOptions_reason(
         objc2_foundation::NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | objc2_foundation::NSActivityOptions::LatencyCritical,
@@ -959,8 +1181,8 @@ fn main() {
         cx.te_was_running,
         cx.primary
     ));
-    let suites: [(char, fn(&Ctx, &mut Out)); 6] =
-        [('a', suite_a), ('b', suite_b), ('c', suite_c), ('d', suite_d), ('e', suite_e), ('f', suite_f)];
+    let suites: [(char, fn(&Ctx, &mut Out)); 7] =
+        [('a', suite_a), ('b', suite_b), ('c', suite_c), ('d', suite_d), ('e', suite_e), ('f', suite_f), ('g', suite_g)];
     for (c, f) in suites {
         if only.contains(c) {
             let t = now_secs();

@@ -162,8 +162,10 @@ pub struct OwnWindow {
 /// The switcher's window list.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
-    /// Grouped by app (contiguous). Apps are ordered by their most recently used window, windows
-    /// within an app most recent first; never-focused windows come after, by z-order.
+    /// Grouped by app (contiguous), the current app first. Windows within an app most recent
+    /// first, its minimized windows last; never-focused windows come after, by z-order. Apps are
+    /// ordered by their first window: their most recently used open window (an app with only
+    /// minimized windows: its most recent one). See [`order_mru`].
     pub windows: Vec<WinInfo>,
     /// Index of the window the user is in right now (the focused window of the frontmost app),
     /// when it is listed. `None` e.g. when the active app has no window or the desktop is focused.
@@ -261,7 +263,7 @@ impl WindowModel {
         let mut mark = |what: &'static str| marks.push((what, t0.elapsed().as_secs_f64() * 1000.0));
         let cg = self.shared.cg();
         // Copy what we need from the model.
-        let (apps, known, ready, used, current_cur, active_pid, active_focus_known, last_scan, own_win) = {
+        let (apps, known, ready, used, minimized_at, current_cur, active_pid, active_focus_known, last_scan, own_win) = {
             let st = self.shared.lock();
             let apps: HashMap<i32, AppMeta> = st
                 .apps
@@ -289,7 +291,7 @@ impl WindowModel {
             let active = st.active_pid;
             let afk = active.and_then(|p| st.apps.get(&p)).is_some_and(|a| a.ready && a.focus_known);
             let last_scan: HashMap<i32, Instant> = st.apps.iter().filter_map(|(p, a)| a.last_scan.map(|t| (*p, t))).collect();
-            (apps, known, ready, st.used.clone(), st.current.map(|c| (c.wid, c.pid)), active, afk, last_scan, st.own_win.clone())
+            (apps, known, ready, st.used.clone(), st.minimized_at(), st.current.map(|c| (c.wid, c.pid)), active, afk, last_scan, st.own_win.clone())
         };
         mark("copy");
 
@@ -444,7 +446,7 @@ impl WindowModel {
             .collect();
 
         let current = pick_current(&wins, current_cur, &used, active_pid, active_focus_known);
-        let (windows_out, current, mru) = order_mru(wins, current, &used);
+        let (windows_out, current, mru) = order_mru(wins, current, &used, &minimized_at);
 
         // Bookkeeping (all cheap, no waiting).
         {
@@ -887,7 +889,8 @@ impl Asks {
 /// `focused` is the model's current window: the active app's focused window, with its pid. When
 /// that window is not listed (a floating panel, palette or inspector has focus), the app's most
 /// recently used on-screen window stands in for it (else its topmost one): the user is visually
-/// in that window, so a quick tap must go to the window before it. When the model has no focus
+/// in that window, so a quick tap must go to the window after it in the switcher's order, not to
+/// that window itself. When the model has no focus
 /// information for the active app (`active_focus_known` false), the topmost window stands in if
 /// it belongs to the active app.
 fn pick_current(
@@ -917,9 +920,19 @@ fn pick_current(
 
 /// Order z-sorted windows (`z_index` == position) for the switcher. MRU: `current` first, then by
 /// last use (`used`: higher = more recent), then never-used windows by z. Windows are grouped by
-/// app, apps ordered by their best MRU position. Returns (windows, current, mru) with indices
-/// into the returned windows.
-fn order_mru(mut wins: Vec<WinInfo>, current: Option<usize>, used: &HashMap<u32, u64>) -> (Vec<WinInfo>, Option<usize>, Vec<usize>) {
+/// app; within an app, MRU order with its minimized windows last, and the apps ordered by their
+/// first window in that order: their most recent open window, or the most recent minimized one
+/// for an app with no open window. The switcher steps through this order (a quick tap: the
+/// window after the current one, so the current app's other windows come before the next app,
+/// and the next app's first window is the one the tap lands on). `minimized_at`: the model's
+/// `seq` when each minimized window was minimized (see `WinRec::min_seq`). Returns (windows,
+/// current, mru) with indices into the returned windows; `mru` is the plain MRU order.
+pub(crate) fn order_mru(
+    mut wins: Vec<WinInfo>,
+    current: Option<usize>,
+    used: &HashMap<u32, u64>,
+    minimized_at: &HashMap<u32, u64>,
+) -> (Vec<WinInfo>, Option<usize>, Vec<usize>) {
     let rank_key = |i: usize, w: &WinInfo| -> (u8, u64) {
         if Some(i) == current {
             (0, 0)
@@ -935,13 +948,27 @@ fn order_mru(mut wins: Vec<WinInfo>, current: Option<usize>, used: &HashMap<u32,
     for (p, &i) in mru.iter().enumerate() {
         pos[i] = p;
     }
-    let mut app_rank: HashMap<i32, usize> = HashMap::new();
-    for (i, w) in wins.iter().enumerate() {
-        let r = app_rank.entry(w.pid).or_insert(usize::MAX);
-        *r = (*r).min(pos[i]);
+    // Within an app, its minimized windows come after its open ones (as minimizing sends a window
+    // to the back on Windows), so stepping from the current window reaches the app's open windows
+    // first, and its minimized ones still before the next app. A window flagged minimized counts
+    // as open when it is current, or when it was used after it was minimized: a switch restored
+    // it and the flag has not caught up yet (it changes with the app's AXWindowDeminiaturized
+    // notification, which can come late or be missed).
+    let demoted = |i: usize| {
+        let w = &wins[i];
+        let restored = used.get(&w.wid).zip(minimized_at.get(&w.wid)).is_some_and(|(u, m)| u > m);
+        w.minimized && Some(i) != current && !restored
+    };
+    // Each app ranks by its first window in that order (the window a step into the app lands on),
+    // so a minimized window that was used more recently than the app's open ones does not move
+    // the app ahead of apps whose open windows were used more recently.
+    let mut first: HashMap<i32, (bool, usize)> = HashMap::new();
+    for i in 0..wins.len() {
+        let k = (demoted(i), pos[i]);
+        first.entry(wins[i].pid).and_modify(|f| *f = (*f).min(k)).or_insert(k);
     }
     let mut order: Vec<usize> = (0..wins.len()).collect();
-    order.sort_by_key(|&i| (app_rank[&wins[i].pid], pos[i]));
+    order.sort_by_key(|&i| (first[&wins[i].pid].1, demoted(i), pos[i]));
     let mut new_idx = vec![0usize; wins.len()];
     for (n, &o) in order.iter().enumerate() {
         new_idx[o] = n;
@@ -1184,12 +1211,34 @@ struct WinRec {
     /// When the minimized flag last changed: until the CG list is newer than this, its on-screen
     /// / Space data for the window may be stale.
     changed_at: Option<Instant>,
+    /// The model's `seq` when the window was last seen being minimized. A window still flagged
+    /// minimized but used after that (its `used` entry is newer) was restored, by a ZTab switch,
+    /// and its flag has not caught up yet: the switcher orders it as an open window.
+    min_seq: u64,
     /// Listed by the app's `AXWindows` at the last scan. Windows that are not (found through the
     /// remote-token sweep) are either on another Space or ordered out, e.g. the background tabs of
     /// a native tab group; `snapshot()` keeps them only when SkyLight puts them on another Space.
     in_ax_list: bool,
     /// When the model first learned about the window (a CG list started later must contain it).
     added_at: Instant,
+}
+
+impl WinRec {
+    /// Apply the minimized flag AX reports; `seq` is the model's `seq` now. `fresh`: from an
+    /// AXWindowMiniaturized / AXWindowDeminiaturized notification, i.e. the window changed just
+    /// now (a minimize then counts even when the flag already said so, after a missed de-minimize
+    /// notification). Returns whether the flag changed.
+    fn set_minimized(&mut self, min: bool, seq: u64, fresh: bool) -> bool {
+        if min && (fresh || !self.minimized) {
+            self.min_seq = seq;
+        }
+        if min == self.minimized {
+            return false;
+        }
+        self.minimized = min;
+        self.changed_at = Some(Instant::now());
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1236,6 +1285,11 @@ impl State {
 
     fn on_screen_known(&self, wid: u32) -> bool {
         self.wins.get(&wid).is_some_and(|w| !w.minimized && !self.apps.get(&w.pid).is_some_and(|a| a.hidden))
+    }
+
+    /// `min_seq` of every window flagged minimized (for [`order_mru`]).
+    fn minimized_at(&self) -> HashMap<u32, u64> {
+        self.wins.iter().filter(|(_, w)| w.minimized).map(|(wid, w)| (*wid, w.min_seq)).collect()
     }
 
     /// Make `new` (wid, pid) the current window. `explicit` (ZTab switched to it) enters it into
@@ -2015,13 +2069,10 @@ impl AppCtx {
                 let s = &mut *st;
                 if let Some(w) = s.wins.get_mut(&wid_ref)
                     && w.epoch == self.epoch
-                    && w.minimized != min
+                    && w.set_minimized(min, s.seq, true)
+                    && min
                 {
-                    w.minimized = min;
-                    w.changed_at = Some(Instant::now());
-                    if min {
-                        s.events.push(ModelEvent::Minimized { wid: wid_ref });
-                    }
+                    s.events.push(ModelEvent::Minimized { wid: wid_ref });
                 }
                 self.shared.flush(st);
                 self.shared.mark_cg_dirty();
@@ -2068,6 +2119,7 @@ impl AppCtx {
         self.local.borrow_mut().els.insert(wid, el.clone());
         let mut st = self.shared.lock();
         st.app(self.pid, self.epoch)?;
+        let seq = st.seq;
         st.wins.entry(wid).or_insert(WinRec {
             pid: self.pid,
             epoch: self.epoch,
@@ -2076,6 +2128,7 @@ impl AppCtx {
             subrole: attrs.subrole,
             minimized: attrs.minimized.unwrap_or(false),
             changed_at: None,
+            min_seq: seq,
             in_ax_list: !via_token,
             added_at: Instant::now(),
         });
@@ -2301,14 +2354,11 @@ impl AppCtx {
                     if a.subrole.is_some() {
                         w.subrole = a.subrole;
                     }
-                    if let Some(m) = a.minimized {
-                        if m && !w.minimized {
-                            s.events.push(ModelEvent::Minimized { wid });
-                        }
-                        if m != w.minimized {
-                            w.changed_at = Some(Instant::now());
-                        }
-                        w.minimized = m;
+                    if let Some(m) = a.minimized
+                        && w.set_minimized(m, s.seq, false)
+                        && m
+                    {
+                        s.events.push(ModelEvent::Minimized { wid });
                     }
                 }
                 _ => {
@@ -2320,6 +2370,7 @@ impl AppCtx {
                         subrole: a.subrole,
                         minimized: a.minimized.unwrap_or(false),
                         changed_at: None,
+                        min_seq: s.seq,
                         in_ax_list: in_list,
                         added_at: Instant::now(),
                     });
@@ -2375,7 +2426,7 @@ mod tests {
         let mut st = State::default();
         for &(wid, pid) in wins {
             st.apps.entry(pid).or_insert_with(|| AppRec::new(1, &AppMeta { name: String::new(), bundle_id: None, hidden: false }));
-            st.wins.insert(wid, WinRec { pid, epoch: 1, el: el(), title: None, subrole: None, minimized: false, changed_at: None, in_ax_list: true, added_at: Instant::now() });
+            st.wins.insert(wid, WinRec { pid, epoch: 1, el: el(), title: None, subrole: None, minimized: false, changed_at: None, min_seq: 0, in_ax_list: true, added_at: Instant::now() });
         }
         st
     }
@@ -2413,13 +2464,147 @@ mod tests {
         let wins = vec![win(10, 1, 0), win(20, 2, 1), win(11, 1, 2), win(30, 3, 3), win(21, 2, 4)];
         // Used: 21 most recent, then 11. Current = 20 (index 1).
         let used = HashMap::from([(21, 9), (11, 5)]);
-        let (out, cur, mru) = order_mru(wins, Some(1), &used);
+        let (out, cur, mru) = order_mru(wins, Some(1), &used, &HashMap::new());
         let wids: Vec<u32> = out.iter().map(|w| w.wid).collect();
         // p2 first (current 20, then 21), p1 (11 used, then 10 by z), p3.
         assert_eq!(wids, vec![20, 21, 11, 10, 30]);
         assert_eq!(cur, Some(0));
         let mru_wids: Vec<u32> = mru.iter().map(|&i| out[i].wid).collect();
         assert_eq!(mru_wids, vec![20, 21, 11, 10, 30]);
+    }
+
+    #[test]
+    fn minimized_windows_follow_the_apps_open_windows() {
+        // p1: current 10, then 12 (minimized, used most recently), 11 (open, used before it);
+        // p2: 20 (open), 21 (minimized, used more recently than 20).
+        let mut wins = vec![win(10, 1, 0), win(11, 1, 1), win(20, 2, 2), win(12, 1, 3), win(21, 2, 4)];
+        wins[3].minimized = true;
+        wins[4].minimized = true;
+        let used = HashMap::from([(12, 9), (21, 8), (11, 7), (20, 6)]);
+        let (out, cur, mru) = order_mru(wins, Some(0), &used, &HashMap::new());
+        let wids: Vec<u32> = out.iter().map(|w| w.wid).collect();
+        // The current app's open window 11 comes before its minimized 12, and 12 before the next
+        // app; p2 lists its open 20 first (and ranks by it: see the next test).
+        assert_eq!(wids, vec![10, 11, 12, 20, 21]);
+        assert_eq!(cur, Some(0));
+        // The MRU order itself is unchanged.
+        assert_eq!(mru.iter().map(|&i| out[i].wid).collect::<Vec<_>>(), vec![10, 12, 21, 11, 20]);
+    }
+
+    #[test]
+    fn current_window_stays_first_even_when_flagged_minimized() {
+        // Right after a switch restored 10, its minimized flag may still be set.
+        let mut wins = vec![win(10, 1, 0), win(11, 1, 1), win(20, 2, 2)];
+        wins[0].minimized = true;
+        let used = HashMap::from([(11, 5), (20, 4)]);
+        let (out, cur, _) = order_mru(wins, Some(0), &used, &HashMap::new());
+        assert_eq!(out.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![10, 11, 20]);
+        assert_eq!(cur, Some(0));
+    }
+
+    fn wids(out: &[WinInfo]) -> Vec<u32> {
+        out.iter().map(|w| w.wid).collect()
+    }
+
+    #[test]
+    fn apps_rank_by_their_first_window_the_one_a_step_lands_on() {
+        // A1 (p1) current, A's only window. B1 (p2) was used, then minimized; C1 (p3) was used
+        // before B1; B2 (p2) is open, used long ago. MRU: A1, B1, C1, B2.
+        let mut wins = vec![win(1, 1, 0), win(21, 2, 1), win(31, 3, 2), win(22, 2, 3)];
+        wins[1].minimized = true;
+        let used = HashMap::from([(21, 9), (31, 8), (22, 7)]);
+        let min_at = HashMap::from([(21, 10)]);
+        let (out, cur, mru) = order_mru(wins, Some(0), &used, &min_at);
+        // B's first window is B2 (its minimized B1 comes last), so B ranks by B2, after C1: the
+        // step after A1 is C1, the most recent open window, not B's oldest window.
+        assert_eq!(wids(&out), vec![1, 31, 22, 21]);
+        assert_eq!(cur, Some(0));
+        assert_eq!(mru.iter().map(|&i| out[i].wid).collect::<Vec<_>>(), vec![1, 21, 31, 22]);
+
+        // No current window: A1, the only window of A on this Space, was just minimized (A2 is on
+        // another Space, used long ago; X1 of p3 in between). The first window (a quick tap's
+        // target) is the most recent open one, X1, not A2.
+        let mut wins = vec![win(1, 1, 0), win(31, 3, 1), win(2, 1, 2)];
+        wins[0].minimized = true;
+        let (out, cur, _) = order_mru(wins, None, &HashMap::from([(1, 11), (31, 8), (2, 7)]), &HashMap::from([(1, 12)]));
+        assert_eq!(wids(&out), vec![31, 2, 1]);
+        assert_eq!(cur, None);
+
+        // An app whose windows are all minimized ranks by its most recent one: D1 (p4, minimized,
+        // used after C1) keeps its place before C.
+        let mut wins = vec![win(1, 1, 0), win(41, 4, 1), win(31, 3, 2)];
+        wins[1].minimized = true;
+        let (out, ..) = order_mru(wins, Some(0), &HashMap::from([(41, 9), (31, 8)]), &HashMap::from([(41, 10)]));
+        assert_eq!(wids(&out), vec![1, 41, 31]);
+    }
+
+    /// The switcher's order of the windows in `st` (z order = wid order), with `cur` current.
+    fn order_of(st: &State, cur: Option<u32>) -> Vec<u32> {
+        let mut ids: Vec<u32> = st.wins.keys().copied().collect();
+        ids.sort();
+        let wins: Vec<WinInfo> = ids
+            .iter()
+            .enumerate()
+            .map(|(z, wid)| WinInfo { minimized: st.wins[wid].minimized, ..win(*wid, st.wins[wid].pid, z) })
+            .collect();
+        let cur = cur.map(|c| ids.iter().position(|w| *w == c).unwrap());
+        wids(&order_mru(wins, cur, &st.used, &st.minimized_at()).0)
+    }
+
+    fn minimize(st: &mut State, wid: u32, min: bool, fresh: bool) -> bool {
+        let seq = st.seq;
+        st.wins.get_mut(&wid).unwrap().set_minimized(min, seq, fresh)
+    }
+
+    #[test]
+    fn a_window_a_switch_restored_keeps_its_place_while_its_flag_lags() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // One app: A3 (oldest), A2, A1. A2 is minimized, its notification arriving either while
+        // it is still current or after the app focused A1.
+        for notified_first in [true, false] {
+            let mut st = state_with(&[(1, 1), (2, 1), (3, 1)]);
+            st.set_current_at(Some((3, 1)), false, at(0));
+            st.set_current_at(Some((2, 1)), false, at(1000));
+            if notified_first {
+                assert!(minimize(&mut st, 2, true, true));
+            }
+            st.set_current_at(Some((1, 1)), false, at(2000));
+            if !notified_first {
+                assert!(minimize(&mut st, 2, true, true));
+            }
+            assert_eq!(order_of(&st, Some(1)), vec![1, 3, 2], "minimized after its last use: last (notified first: {notified_first})");
+
+            // ZTab switches to A2 (restoring it), then a quick tap back to A1, both before the
+            // de-minimize notification: A2 is still flagged minimized, but used after it was
+            // minimized, so it keeps its MRU place and the next tap toggles back to it.
+            st.set_current_at(Some((2, 1)), true, at(3000));
+            assert_eq!(order_of(&st, Some(2)), vec![2, 1, 3]);
+            st.set_current_at(Some((1, 1)), true, at(3100));
+            assert!(st.wins[&2].minimized);
+            assert_eq!(order_of(&st, Some(1)), vec![1, 2, 3], "restored A2 toggles (notified first: {notified_first})");
+            // The notification lands: the same order.
+            assert!(minimize(&mut st, 2, false, true));
+            assert_eq!(order_of(&st, Some(1)), vec![1, 2, 3]);
+            // Minimized again: last again.
+            assert!(minimize(&mut st, 2, true, true));
+            assert_eq!(order_of(&st, Some(1)), vec![1, 3, 2]);
+        }
+
+        // The de-minimize notification was missed and the window is minimized again: the new
+        // minimize notification counts although the flag did not change; a scan that reads the
+        // same flag does not.
+        let mut st = state_with(&[(1, 1), (2, 1), (3, 1)]);
+        st.set_current_at(Some((3, 1)), true, at(0));
+        st.set_current_at(Some((2, 1)), true, at(100));
+        st.set_current_at(Some((1, 1)), true, at(200));
+        assert!(minimize(&mut st, 2, true, true));
+        st.set_current_at(Some((2, 1)), true, at(300));
+        st.set_current_at(Some((1, 1)), true, at(400));
+        assert!(!minimize(&mut st, 2, true, false), "a scan reading the same flag changes nothing");
+        assert_eq!(order_of(&st, Some(1)), vec![1, 2, 3]);
+        assert!(!minimize(&mut st, 2, true, true));
+        assert_eq!(order_of(&st, Some(1)), vec![1, 3, 2]);
     }
 
     #[test]
@@ -2430,10 +2615,11 @@ mod tests {
         let used = HashMap::from([(20, 3), (11, 4), (10, 5)]);
         let cur = pick_current(&wins, Some((99, 1)), &used, Some(1), true);
         assert_eq!(cur, Some(0), "D stands in for the unlisted panel");
-        let (out, cur, mru) = order_mru(wins.clone(), cur, &used);
+        let (out, cur, mru) = order_mru(wins.clone(), cur, &used, &HashMap::new());
         assert_eq!(out[cur.unwrap()].wid, 10);
-        // D heads the MRU order, so a quick tap (main.rs `initial_selection`: the second MRU entry
-        // when there is a current window) goes to the window before D, not to D itself.
+        // D is current, so a quick tap (main.rs `initial_selection`: the window after the current
+        // one in this order) goes to F, the app's other window, not to D itself.
+        assert_eq!(out.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![10, 11, 20]);
         assert_eq!(mru.iter().map(|&i| out[i].wid).collect::<Vec<_>>(), vec![10, 11, 20]);
         // Without history the app's topmost on-screen window stands in.
         assert_eq!(pick_current(&wins, Some((99, 1)), &HashMap::new(), Some(1), true), Some(0));
@@ -2458,7 +2644,7 @@ mod tests {
     #[test]
     fn order_without_history_is_z_order() {
         let wins = vec![win(1, 1, 0), win(2, 2, 1), win(3, 1, 2)];
-        let (out, cur, mru) = order_mru(wins, None, &HashMap::new());
+        let (out, cur, mru) = order_mru(wins, None, &HashMap::new(), &HashMap::new());
         assert_eq!(out.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![1, 3, 2]);
         assert_eq!(cur, None);
         assert_eq!(mru.iter().map(|&i| out[i].wid).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -2507,7 +2693,8 @@ mod tests {
         st.activate(own);
         assert_eq!(st.current.map(|c| c.wid), Some(99));
         st.activate(10);
-        // The switcher's view: with ZTab's window current, the quick tap goes to window 1.
+        // The switcher's view: with ZTab's window (its only one) current, the quick tap goes to
+        // the next app's window 1.
         let wins = vec![
             WinInfo { pid: own, ..win(99, own, 0) },
             win(1, 10, 1),
@@ -2515,7 +2702,7 @@ mod tests {
         let used: HashMap<u32, u64> = [(1, 5)].into_iter().collect();
         let cur = pick_current(&wins, Some((99, own)), &used, Some(own), false);
         assert_eq!(cur, Some(0));
-        let (out, cur, mru) = order_mru(wins, cur, &used);
+        let (out, cur, mru) = order_mru(wins, cur, &used, &HashMap::new());
         assert_eq!(out[cur.unwrap()].wid, 99);
         assert_eq!(out[mru[1]].wid, 1);
     }

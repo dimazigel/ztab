@@ -353,16 +353,24 @@ fn filter_snapshot(snap: Snapshot, keep: impl Fn(&WinInfo) -> bool) -> (Vec<WinI
     (out, current, mru)
 }
 
-/// Which window a session preselects: Shift => least recently used; otherwise the previous
-/// window when the user is in a window right now, else the most recent one.
-fn initial_selection(current: Option<usize>, mru: &[usize], reverse: bool) -> Option<usize> {
-    if reverse {
-        mru.last().copied()
-    } else if current.is_some() {
-        mru.get(1).or(mru.first()).copied()
-    } else {
-        mru.first().copied()
+/// Which window a session preselects, stepping through the switcher's own order (windows grouped
+/// by app: the current app's windows first, most recent first with its minimized ones last, then
+/// the other apps by their first window, i.e. their most recent open window; see
+/// `model::order_mru`). Without Shift: the window
+/// after the current one, so ⌥Tab goes through the current app's other windows before it reaches
+/// the next app; with Shift: the one before it (wrapping to the last). With no current window
+/// (desktop focus, or ⌥` in an app whose focused window is not listed): the first (Shift: the
+/// last).
+fn initial_selection(current: Option<usize>, n: usize, reverse: bool) -> Option<usize> {
+    if n == 0 {
+        return None;
     }
+    Some(match (current, reverse) {
+        (Some(c), false) => (c + 1) % n,
+        (Some(c), true) => (c + n - 1) % n,
+        (None, false) => 0,
+        (None, true) => n - 1,
+    })
 }
 
 impl State {
@@ -465,7 +473,7 @@ impl State {
         } else {
             filter_snapshot(snap, |_| true)
         };
-        let Some(sel) = initial_selection(current, &mru, reverse) else {
+        let Some(sel) = initial_selection(current, list.len(), reverse) else {
             log(&format!("open: no windows (same_app={same_app} active_pid={active_pid:?})"));
             return false;
         };
@@ -491,15 +499,17 @@ impl State {
         let labels = self.switcher.prefetch_labels(&tiles);
         let labels_ms = ms_since(t_labels);
         let mru_wids: Vec<String> = mru.iter().map(|&i| list[i].wid.to_string()).collect();
+        let order_wids: Vec<String> = list.iter().map(|w| w.wid.to_string()).collect();
         let tap = tap_ms.map(|ms| format!(" tap_to_main_ms={ms:.1}")).unwrap_or_default();
         let delay = self.settings.borrow().show_delay_ms;
         log(&format!(
             "open: {} windows, current={current:?} selected={sel} wid={} (reverse={reverse}, same_app={same_app}) \
-             active_pid={active_pid:?} mru={} delay_ms={delay} list_ms={t_list:.2} labels_queued={labels} \
+             active_pid={active_pid:?} mru={} order={} delay_ms={delay} list_ms={t_list:.2} labels_queued={labels} \
              labels_ms={labels_ms:.2} total_ms={:.2}{tap}",
             list.len(),
             list[sel].wid,
             mru_wids.join(","),
+            order_wids.join(","),
             ms_since(t0)
         ));
         *self.wins.borrow_mut() = list;
@@ -1512,7 +1522,7 @@ impl State {
 
     /// The Settings window is closing or was minimized (`why`) while ZTab is the active app: an
     /// accessory app with no other window would keep the keyboard focus, so switch to the most
-    /// recently used window (as a quick ⌥Tab would).
+    /// recently used open window on the current Space (as closing a window does in any app).
     fn focus_away_from_settings(&self, why: &str) {
         if !NSApplication::sharedApplication(self.mtm).isActive() {
             return;
@@ -2699,15 +2709,109 @@ mod tests {
 
     #[test]
     fn selection_rules() {
-        // Quick tap: previous window when in a window, else the most recent one.
-        assert_eq!(initial_selection(Some(2), &[2, 0, 1], false), Some(0));
-        assert_eq!(initial_selection(None, &[2, 0, 1], false), Some(2));
+        // Next window in the switcher's order (current app's windows first), wrapping.
+        assert_eq!(initial_selection(Some(0), 3, false), Some(1));
+        assert_eq!(initial_selection(Some(2), 3, false), Some(0));
+        assert_eq!(initial_selection(None, 3, false), Some(0));
         // Single window: stays on it.
-        assert_eq!(initial_selection(Some(0), &[0], false), Some(0));
-        // Shift: least recently used.
-        assert_eq!(initial_selection(Some(2), &[2, 0, 1], true), Some(1));
-        assert_eq!(initial_selection(None, &[], false), None);
-        assert_eq!(initial_selection(None, &[], true), None);
+        assert_eq!(initial_selection(Some(0), 1, false), Some(0));
+        assert_eq!(initial_selection(Some(0), 1, true), Some(0));
+        // Shift: the one before (the last one from the first).
+        assert_eq!(initial_selection(Some(0), 3, true), Some(2));
+        assert_eq!(initial_selection(Some(2), 3, true), Some(1));
+        assert_eq!(initial_selection(None, 3, true), Some(2));
+        assert_eq!(initial_selection(None, 0, false), None);
+        assert_eq!(initial_selection(None, 0, true), None);
+    }
+
+    #[test]
+    fn quick_tap_goes_through_the_current_apps_windows_before_the_next_app() {
+        // Model order: app 2 (current 21, then 22), then app 1 (10, 11). MRU: 21, 10, 22, 11.
+        let snap = Snapshot {
+            windows: vec![win(21, 2), win(22, 2), win(10, 1), win(11, 1)],
+            current: Some(0),
+            mru: vec![0, 2, 1, 3],
+            active_pid: Some(2),
+        };
+        let (w, cur, _) = filter_snapshot(snap, |_| true);
+        let sel = initial_selection(cur, w.len(), false).unwrap();
+        assert_eq!(w[sel].wid, 22, "the app's other window, not the more recently used window of app 1");
+        // From the app's last window the next step is the next app.
+        assert_eq!(w[initial_selection(Some(1), w.len(), false).unwrap()].wid, 10);
+    }
+
+    /// A snapshot ordered the way the model orders it (`model::order_mru`); `used`: (wid, seq),
+    /// higher = more recent.
+    fn ordered(wins: Vec<WinInfo>, current: Option<u32>, used: &[(u32, u64)], active_pid: Option<i32>) -> Snapshot {
+        let cur = current.map(|c| wins.iter().position(|w| w.wid == c).unwrap());
+        let used: std::collections::HashMap<u32, u64> = used.iter().copied().collect();
+        let (windows, current, mru) = model::order_mru(wins, cur, &used, &std::collections::HashMap::new());
+        Snapshot { windows, current, mru, active_pid }
+    }
+
+    /// The window a quick tap (Shift: `reverse`) switches to, over all windows or only the active
+    /// app's (⌥`).
+    fn quick_tap(snap: Snapshot, same_app: bool, reverse: bool) -> Option<u32> {
+        let active = snap.active_pid;
+        let (w, cur, _) = if same_app { filter_snapshot(snap, |w| Some(w.pid) == active) } else { filter_snapshot(snap, |_| true) };
+        initial_selection(cur, w.len(), reverse).map(|i| w[i].wid)
+    }
+
+    fn minimized(mut w: WinInfo) -> WinInfo {
+        w.minimized = true;
+        w
+    }
+
+    #[test]
+    fn quick_tap_prefers_the_current_apps_windows_over_more_recent_apps() {
+        // A1 current; B1 (another app) used after A2.
+        let wins = || vec![win(1, 10), win(2, 10), win(5, 20)];
+        let used = [(5, 9), (2, 8)];
+        assert_eq!(quick_tap(ordered(wins(), Some(1), &used, Some(10)), false, false), Some(2));
+        // From A2 the toggle goes back to A1 (A1 is now the app's most recent other window).
+        assert_eq!(quick_tap(ordered(wins(), Some(2), &[(5, 8), (1, 9)], Some(10)), false, false), Some(1));
+        // An app with one window: the next app's most recent window.
+        assert_eq!(quick_tap(ordered(wins(), Some(5), &[(1, 9), (2, 8)], Some(20)), false, false), Some(1));
+        // The order: all of A's windows, then B: stepping on from A's last window reaches B.
+        let s = ordered(wins(), Some(1), &used, Some(10));
+        assert_eq!(s.windows.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![1, 2, 5]);
+        assert_eq!(initial_selection(Some(1), 3, false).map(|i| s.windows[i].wid), Some(5));
+        // Shift: the last window of the list (the least recently used app's last window).
+        assert_eq!(quick_tap(ordered(vec![win(1, 10), win(2, 10), win(5, 20), win(6, 20)], Some(1), &[(5, 9), (2, 8), (6, 7)], Some(10)), false, true), Some(6));
+    }
+
+    #[test]
+    fn quick_tap_reaches_the_apps_minimized_windows_after_its_open_ones() {
+        // A1 current, A2 minimized (used most recently), A3 open, B1 another app.
+        let used = [(2, 9), (5, 8), (3, 7)];
+        let s = ordered(vec![win(1, 10), minimized(win(2, 10)), win(3, 10), win(5, 20)], Some(1), &used, Some(10));
+        assert_eq!(s.windows.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![1, 3, 2, 5]);
+        assert_eq!(quick_tap(s, false, false), Some(3), "the app's open window first");
+        // Only a minimized other window: it is still the app's next window, before the next app.
+        let s = ordered(vec![win(1, 10), minimized(win(2, 10)), win(5, 20)], Some(1), &[(5, 9), (2, 8)], Some(10));
+        assert_eq!(quick_tap(s, false, false), Some(2));
+        // From a single-window app: the next app is the one whose open window was used most
+        // recently (C1), not B, whose most recent window B1 is minimized and whose open B2 is old.
+        let s = ordered(vec![win(1, 10), minimized(win(21, 20)), win(31, 30), win(22, 20)], Some(1), &[(21, 9), (31, 8), (22, 7)], Some(10));
+        assert_eq!(quick_tap(s, false, false), Some(31));
+    }
+
+    #[test]
+    fn quick_tap_without_a_current_window_or_from_a_single_window_app() {
+        // Desktop focus (no current window): the most recent window, its app's group first.
+        let wins = || vec![win(1, 10), win(2, 10), win(5, 20)];
+        let s = ordered(wins(), None, &[(5, 9), (1, 8), (2, 7)], Some(30));
+        assert_eq!(s.windows.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![5, 1, 2]);
+        assert_eq!(quick_tap(s, false, false), Some(5));
+        // ⌥` with the active app's focused window not listed: the app's most recent window.
+        assert_eq!(quick_tap(ordered(wins(), None, &[(5, 9), (2, 8), (1, 7)], Some(10)), true, false), Some(2));
+        // ⌥` from A1: the app's other window, never another app's.
+        assert_eq!(quick_tap(ordered(wins(), Some(1), &[(5, 9), (2, 8)], Some(10)), true, false), Some(2));
+        // ZTab's own Settings window (its app's only window) current: the next app's most recent
+        // window.
+        let own = std::process::id() as i32;
+        let s = ordered(vec![win(99, own), win(1, 10), win(2, 10)], Some(99), &[(2, 9), (1, 8)], Some(own));
+        assert_eq!(quick_tap(s, false, false), Some(2));
     }
 
     #[test]
@@ -2722,7 +2826,7 @@ mod tests {
         assert_eq!(w.iter().map(|w| w.wid).collect::<Vec<_>>(), vec![20, 21, 22]);
         assert_eq!(cur, Some(1));
         assert_eq!(mru, vec![1, 2, 0]);
-        assert_eq!(initial_selection(cur, &mru, false), Some(2));
+        assert_eq!(initial_selection(cur, w.len(), false), Some(2));
         // Filter that drops the current window.
         let snap = Snapshot { windows: vec![win(10, 1), win(20, 2)], current: Some(0), mru: vec![0, 1], active_pid: Some(2) };
         let (w, cur, mru) = filter_snapshot(snap, |w| w.pid == 2);
