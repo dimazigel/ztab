@@ -363,11 +363,28 @@ pub fn agent_plist(program: &str) -> String {
 
 /// This process's binary (inside the app bundle when run from one).
 pub fn current_program() -> String {
-    std::env::current_exe()
+    let path = std::env::current_exe()
         .ok()
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    stable_program(&path, |p| std::fs::canonicalize(p).ok().map(|c| c.to_string_lossy().into_owned()))
+}
+
+/// A Homebrew install runs from a versioned keg (`<prefix>/Cellar/ztab/<version>/...`) that
+/// `brew upgrade` deletes; the login agent must name the stable `<prefix>/opt/ztab/...` link
+/// instead. `canon` resolves a path (symlinks), so the opt path is used only when it leads to
+/// this very binary. Any other path is returned as it is.
+pub fn stable_program(path: &str, canon: impl Fn(&str) -> Option<String>) -> String {
+    let Some(i) = path.find("/Cellar/ztab/") else {
+        return path.to_string();
+    };
+    let rest = &path[i + "/Cellar/ztab/".len()..];
+    let Some(j) = rest.find('/') else {
+        return path.to_string();
+    };
+    let opt = format!("{}/opt/ztab{}", &path[..i], &rest[j..]);
+    if canon(&opt).as_deref() == Some(path) { opt } else { path.to_string() }
 }
 
 /// `ztab --set-login on|off` / `--login-status` (command line, before any GUI): change the
@@ -627,6 +644,21 @@ mod tests {
         std::fs::write(&p.agent_plist, agent_plist(prog).replace("<string>dev.ztab.app</string>\n\t<key>Prog", "<string>other</string>\n\t<key>Prog")).unwrap();
         assert!(!p.login_enabled());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn homebrew_keg_path_becomes_the_opt_link() {
+        let keg = "/opt/homebrew/Cellar/ztab/0.2.2/ZTab.app/Contents/MacOS/ztab";
+        let opt = "/opt/homebrew/opt/ztab/ZTab.app/Contents/MacOS/ztab";
+        // The opt link leads to this binary: use it.
+        assert_eq!(stable_program(keg, |p| (p == opt).then(|| keg.to_string())), opt);
+        // The opt link leads elsewhere (another version linked) or is missing: keep the keg path.
+        assert_eq!(stable_program(keg, |_| Some("/somewhere/else".into())), keg);
+        assert_eq!(stable_program(keg, |_| None), keg);
+        // Not a Homebrew keg: unchanged.
+        let app = "/Applications/ZTab.app/Contents/MacOS/ztab";
+        assert_eq!(stable_program(app, |_| panic!("not consulted")), app);
+        assert_eq!(stable_program("/x/Cellar/ztab/1.0", |_| None), "/x/Cellar/ztab/1.0");
     }
 
     #[test]

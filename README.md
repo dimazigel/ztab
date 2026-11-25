@@ -42,6 +42,21 @@ It switches between *windows*, not apps.
   **Quit ZTab**.
   While **secure input** is on, the icon gets a lock and the menu says that macOS is pausing ⌥Tab.
 
+## Install with Homebrew
+
+```sh
+brew install dimazigel/tap/ztab
+ztab --set-login on          # start ZTab now and at every login
+```
+
+Homebrew builds ZTab from source on your Mac (it needs Rust, which it installs for the build), so
+macOS shows no "cannot verify the developer" warning. The app is in
+`$(brew --prefix)/opt/ztab/ZTab.app`; to see it in Launchpad and Spotlight, link it into
+Applications: `ln -sf "$(brew --prefix)/opt/ztab/ZTab.app" ~/Applications/`. The login item
+points at Homebrew's stable `opt` path, so it survives `brew upgrade`. A Homebrew build is signed
+ad hoc (no developer identity), so macOS asks for the Accessibility and Screen Recording
+permissions again after each upgrade. Use either Homebrew or the installer package, not both.
+
 ## Build and install
 
 You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
@@ -418,3 +433,7 @@ Normal`.
 - **Screen lock / unlock** are taken from loginwindow's `com.apple.screenIsLocked` /
   `screenIsUnlocked` notifications, with the 30 s tick as the fallback; this path, display sleep
   and session switches have unit-tested decision logic but were not exercised live.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
