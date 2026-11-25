@@ -377,6 +377,134 @@ pub fn spawn_relaunch(plan: &Relaunch) -> Result<String, String> {
     }
 }
 
+/// A restart's work off the main thread (the restart thread of `main`'s `restart_self`, or the
+/// watchdog of a stuck main thread): start the relaunch for `xpc` / `exe` / `args`, then `exit`.
+/// Through launchd (`Kickstart`) launchd stops this process; if it still runs 5 s later, or
+/// launchctl failed, the helper relaunches it directly. `who` prefixes the log lines; `flush`
+/// writes the log out before anything can end this process. `Ok`: `exit` was called (it may
+/// return, e.g. when it only asks the main thread to exit). `Err`: no restart could be started.
+#[allow(clippy::too_many_arguments)]
+pub fn relaunch_then_exit(
+    xpc: Option<&str>,
+    uid: u32,
+    exe: &Path,
+    args: &[String],
+    who: &str,
+    log: fn(&str),
+    flush: &dyn Fn(),
+    exit: &dyn Fn(),
+) -> Result<(), String> {
+    let plan = relaunch_plan(xpc, uid, exe, args);
+    log(&format!("{who}: restart plan {plan:?}"));
+    flush();
+    let kickstart = matches!(plan, Relaunch::Kickstart { .. });
+    let mut failed = String::new();
+    match spawn_relaunch(&plan) {
+        Ok(what) if kickstart => {
+            log(&format!("{who}: {what}: launchd stops this ZTab and starts it again"));
+            flush();
+            std::thread::sleep(Duration::from_secs(5));
+            log(&format!("{who}: still running 5 s after launchctl kickstart; restarting it directly"));
+        }
+        Ok(what) => {
+            log(&format!("{who}: {what}; exiting"));
+            flush();
+            exit();
+            return Ok(());
+        }
+        Err(e) => {
+            log(&format!("{who}: restart failed: {e}"));
+            failed = e;
+        }
+    }
+    if kickstart {
+        match spawn_relaunch(&relaunch_plan(None, uid, exe, args)) {
+            Ok(what) => {
+                log(&format!("{who}: {what}; exiting"));
+                flush();
+                exit();
+                return Ok(());
+            }
+            Err(e) => {
+                log(&format!("{who}: restart failed: {e}"));
+                failed = e;
+            }
+        }
+    }
+    Err(failed)
+}
+
+/// The start of the health-marker reason of a restart for a stuck main thread.
+pub const WEDGE_REASON: &str = "its main thread was stuck for";
+
+pub fn wedge_reason(blocked: Duration) -> String {
+    format!("{WEDGE_REASON} {:.0} s", blocked.as_secs_f64())
+}
+
+pub fn is_wedge_reason(reason: &str) -> bool {
+    reason.starts_with(WEDGE_REASON)
+}
+
+/// The binary a restart for a stuck main thread starts: `exe`, or `fallback` when `exe` is gone
+/// and the fallback exists.
+pub fn wedge_target(exe: &Path, fallback: Option<&Path>) -> PathBuf {
+    match fallback {
+        Some(f) if !exe.exists() && f.exists() => f.to_path_buf(),
+        _ => exe.to_path_buf(),
+    }
+}
+
+/// What restarting a ZTab whose main thread is stuck needs, captured on the main thread at
+/// launch (`main`'s stall watchdog; the self-test's child).
+pub struct WedgeRestart {
+    pub xpc: Option<String>,
+    pub exe: PathBuf,
+    /// Started instead when `exe` is gone by then (an upgrade removed it, e.g. `brew upgrade`
+    /// deleting the old keg): the path ZTab is opened by (`settings::current_program`, a Homebrew
+    /// keg by its stable `opt` link).
+    pub fallback_exe: Option<PathBuf>,
+    pub args: Vec<String>,
+    /// The health marker: the restarted ZTab shows its status, saying why it restarted.
+    pub marker: PathBuf,
+    pub log: fn(&str),
+    pub flush: fn(),
+}
+
+/// The main thread has been stuck in one unit of work for `blocked` (the stall watcher saw it, and
+/// saw it again a moment later): from the watcher's thread, write the health marker, start the
+/// relaunch (see [`relaunch_then_exit`]) and end this process with `_exit` (nothing on the main
+/// thread runs any more, so neither `exit` nor the main queue can be used). Returns only when no
+/// restart could be started (the reason).
+pub fn wedge_restart(w: &WedgeRestart, blocked: Duration, now_unix: f64) -> String {
+    (w.log)(&format!(
+        "wedge: the main thread has been stuck in one unit of work for {:.1} s: restarting ZTab from the stall watcher's thread",
+        blocked.as_secs_f64()
+    ));
+    if let Err(e) = crate::health::write_marker(&w.marker, now_unix, &wedge_reason(blocked)) {
+        (w.log)(&format!("wedge: could not write the restart marker {}: {e}", w.marker.display()));
+    }
+    // SAFETY: ends the process at once; the log was flushed.
+    let exit = || {
+        (w.flush)();
+        unsafe { libc::_exit(0) }
+    };
+    let flush = || (w.flush)();
+    // SAFETY: plain system call.
+    let uid = unsafe { libc::getuid() };
+    let exe = wedge_target(&w.exe, w.fallback_exe.as_deref());
+    if exe != w.exe {
+        (w.log)(&format!("wedge: {} is gone; starting {} instead", w.exe.display(), exe.display()));
+    }
+    match relaunch_then_exit(w.xpc.as_deref(), uid, &exe, &w.args, "wedge", w.log, &flush, &exit) {
+        Ok(()) => String::new(),
+        Err(e) => {
+            (w.log)(&format!("wedge: could not restart ({e}); this ZTab stays as it is"));
+            let _ = std::fs::remove_file(&w.marker);
+            e
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reopen marker
 // ---------------------------------------------------------------------------------------------
@@ -422,6 +550,24 @@ pub fn take_marker(path: &Path, now_unix: f64) -> Option<Reopen> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wedge_restart_starts_the_opened_path_when_its_binary_is_gone() {
+        let d = std::env::temp_dir().join(format!("zt-wt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let (old, stable) = (d.join("old-keg-ztab"), d.join("opt-ztab"));
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&stable, b"y").unwrap();
+        assert_eq!(wedge_target(&old, Some(&stable)), old, "its own binary while it exists");
+        assert_eq!(wedge_target(&old, None), old);
+        std::fs::remove_file(&old).unwrap();
+        assert_eq!(wedge_target(&old, Some(&stable)), stable, "removed by an upgrade: the opened path");
+        std::fs::remove_file(&stable).unwrap();
+        assert_eq!(wedge_target(&old, Some(&stable)), old, "no better choice");
+        assert!(is_wedge_reason(&wedge_reason(Duration::from_millis(15400))) && wedge_reason(Duration::from_secs(15)).ends_with("15 s"));
+        assert!(!is_wedge_reason("⌥Tab's keyboard hook does not respond"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn launch_rules() {

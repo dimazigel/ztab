@@ -107,7 +107,7 @@ fi
 # 3. Running?
 for _ in $(seq 1 30); do running && break; sleep 0.1; done
 if ! running; then
-  as_user /usr/bin/open -g "$APP" || true
+  as_user /usr/bin/open -g "$APP" --args --background || true
   for _ in $(seq 1 30); do running && break; sleep 0.1; done
   running || echo "ZTab postinstall: ZTab did not start (another copy may still be running)" >&2
 fi

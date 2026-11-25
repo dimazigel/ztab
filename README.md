@@ -57,6 +57,8 @@ Homebrew cannot turn on a login item while it installs, so ZTab does it itself o
 above. If ZTab ran for you before (an earlier install, a copy opened from a disk image), the first
 launch leaves the login item as it is; turn it on with *Start ZTab at login* in Settings, or with
 `ztab --set-login on` (which also starts ZTab now). Untick the box to stop it starting at login.
+Running the same `open` again later is always safe: ZTab checks itself and shows the result, and
+after `brew upgrade` it replaces the running old version (see [Opening ZTab](#opening-ztab)).
 
 Homebrew builds ZTab from source on your Mac (it needs Rust, which it installs for the build), so
 macOS shows no "cannot verify the developer" warning. The app is in
@@ -219,6 +221,74 @@ Quit any other switcher bound to ⌥Tab (for example AltTab) or change its short
 event tap sits at the HID level and normally gets the keys first, but two switchers at once is
 confusing.
 
+## Opening ZTab
+
+Opening ZTab by hand (double-clicking it in Finder, from Spotlight or Launchpad, or
+`open /Applications/ZTab.app`, `open "$(brew --prefix)/opt/ztab/ZTab.app"`) always ends with one
+ZTab running for you and something to see:
+
+- **It was not running**: ZTab starts. When a permission is missing, the **Set up ZTab** window
+  opens (as at the first launch). Otherwise the **Settings** window opens with a status line, for
+  example *ZTab is running: hold ⌥ and press Tab to switch windows.* (the shortcut in use).
+- **It runs**: it checks itself (see below) and shows the result the same way. macOS either hands
+  the reopen to the running ZTab (the same copy) or starts a second process (another copy, or
+  `open -n`); that process asks the running ZTab and exits.
+- **Another binary runs**: another copy, another version, or the app was replaced since it
+  started (an upgrade by `brew upgrade`, the installer package or `install.sh`). When a second
+  process asks, the running ZTab quits and the one just opened takes over and shows its status
+  (*Fixed: replaced ZTab 0.2.4 (…) that was running.*). When macOS hands the reopen to the running
+  ZTab instead, its health check finds another binary at the path it was opened by and restarts
+  into it, once (*Fixed: ZTab restarted itself (another ZTab binary was installed at …).*). So
+  opening ZTab after an upgrade runs the new version.
+- **It does not respond** within about 2 s: its main thread is stuck, the process is stopped, or it
+  is ZTab 0.2.3 or older, which cannot be asked. The one just opened stops it (SIGTERM, then
+  SIGKILL after 2 s) and takes over (*Fixed: replaced a ZTab that did not respond (pid …).*). Only a
+  process of this user named `ztab` that holds ZTab's instance lock is ever stopped, and one that
+  started less than 5 s ago is still starting: the new one asks it again instead (for up to 12 s).
+
+ZTab started by its login agent at login, or by a script (with any argument of its own, such as
+`--settings-dir`, or with `--background`, as `install.sh` and the installer package start it),
+opens no window: when another ZTab runs it exits at once without asking it, as before (the log
+says `another ZTab instance is running; exiting (pid …, started by launchd …)`). A launch from
+the Login Items list that becomes the running ZTab opens no window either, when its launch event
+carries macOS's login-item mark (`keyAELaunchedAsLogInItem`; ZTab reads it when it finishes
+launching, and logs the event as `launch event: …`). One that finds ZTab running exits before it
+can read that mark, so it is treated like any launch without arguments: quietly in the first 30
+seconds after login (below), as opened by hand later. ZTab is never in macOS's own *Reopen
+windows when logging back in* list (it opts out: its login agent starts it, when start at login
+is on).
+
+In the first 30 seconds after you log in (the console login time in `utmpx`), a launch without
+arguments, or a reopen event, may still be a login item rather than you, so it is handled
+*quietly*: everything is checked and repaired as above, and a ZTab that does not answer is
+replaced, but a window opens only when something is wrong or was fixed, and another binary that
+answers is not replaced (the log says `quietly`).
+
+### If ZTab misbehaves, open it again
+
+Each time it is opened by hand, ZTab runs a health check: the parts that can block run on a
+background thread (the permission checks, one of them in a child process, the tap thread's answer,
+the login agent, the lock and socket files; the log gives the time), the main thread only reads
+ZTab's own state, and while a switcher session is open the check waits, so it
+never comes between you and ⌥Tab. What it finds and fixes is in the status line (*Fixed: …*) and
+in the log (`health …` lines):
+
+| Checked | When it is not right |
+|---|---|
+| Accessibility, Screen Recording | The Set up window opens instead of Settings (for Screen Recording only unless you chose *Skip Thumbnails*; then the status says thumbnails are off). Screen Recording granted since ZTab started: ZTab restarts so that thumbnails work, as the Set up window does. |
+| The binary | Another binary is installed at the path ZTab was opened by (an upgrade in place, or Homebrew's `opt` link now pointing at a newer keg): ZTab restarts into it (through that path, or its login agent), once; everything else is then checked by the new one. |
+| ⌥Tab's keyboard hook (the event tap): installed, enabled, its thread answering | Switched off by macOS: switched on again (*Fixed: …*). Not installed although Accessibility is granted, not answering within 0.5 s, or staying off: ZTab restarts itself once; the restarted ZTab shows its status saying why. If the restart did not help, the status says so (in orange) and ZTab does not restart again (after any restart by the health check, it never makes another). |
+| The window list | Not running although Accessibility is granted: started. Still not complete after 30 s: mentioned. |
+| The main thread | A stall of 2 s or more since launch is mentioned (the log has its details). Stuck in one piece of work for 15 s, and still a second later: ZTab restarts itself from the stall watcher's thread (it does not need the stuck one), and the restarted ZTab shows its status (*Fixed: ZTab restarted itself (its main thread was stuck for 15 s).*). It does not do that again within 10 minutes of such a restart. |
+| Start at login | When it starts a removed copy or another copy of ZTab, it is pointed at this copy (*Fixed: start at login pointed at a removed copy (…); it starts this one now.*), only when it was on and this copy is an installed one (not a development build, a disk image or a translocated download: the same rule as the first launch; otherwise the status names the program it starts). It is never turned on. |
+| One ZTab | The single-instance lock and the socket a second ZTab asks through live in the temporary directory, which macOS cleans up; a removed file is created again while the lock is still this ZTab's (also checked every 10 minutes). When another ZTab took the lock on a new file meanwhile, this one leaves the socket to it and quits once it answers (opened by hand: that one shows its status), so only one runs; one that does not answer is named in the status. |
+| Secure input | Mentioned: macOS withholds ⌥Tab while it is on. |
+
+When the same copy is opened while its main thread is stuck, macOS hands the reopen to that stuck
+process, which cannot answer it; the stall watchdog above restarts it at most about 16 s after it
+got stuck, and the restarted ZTab shows its status. `open -n /Applications/ZTab.app` starts a
+second process at once, which replaces it within about 2 s.
+
 ## Settings
 
 Menu-bar icon → **Settings…** (⌘, while the menu is open) opens a normal window; ZTab activates
@@ -300,8 +370,9 @@ Management has registered it again, a few seconds later. `install.sh` reloads th
 (`--set-login on`), which avoids it.
 
 Only one ZTab runs at a time: each takes an exclusive lock on `dev.ztab.app.lock` in the user's
-temporary directory, and a second one (a double launch at login, or the binary started by hand
-while ZTab runs) logs `another ZTab instance is running; exiting` and quits at once.
+temporary directory. A second one started by launchd or a script (a double launch at login) logs
+`another ZTab instance is running; exiting (…)` and quits at once; one opened by hand asks the
+running ZTab, or replaces it (see [Opening ZTab](#opening-ztab)).
 
 **Tests and isolation**: `--settings-dir <dir>` (or the environment variable `ZTAB_SETTINGS_DIR`)
 puts the settings file *and* the login agent inside `<dir>` (`<dir>/settings.conf`,
@@ -384,13 +455,15 @@ line (a log it created would count as a sign that ZTab ran before).
 | `src/model.rs` | Persistent window model. One background thread per app hosts that app's `AXObserver` (window created / destroyed / minimized / focus / title notifications) and makes every Accessibility call for it with a 0.5 s timeout, so a hung app only stalls its own thread. Notifications keep the model current; a safety-net rescan reads only `AXWindows` (plus new windows) every 60 s, every 7 s for an app whose notifications could not all be registered, and every window's attributes every 5 minutes. A second background thread keeps the CoreGraphics window list and Space membership (refreshed after window events and every 5 s). The main thread only merges that cached state (`snapshot()`, about 0.1 ms, no IPC) and keeps the most-recently-used window history. |
 | `src/windows.rs` | CoreGraphics / Accessibility / SkyLight helpers (window lists, AX attributes, remote-token lookup of other-Space windows, Space membership). Focuses exactly one window with the `Focuser`: a serial `ztab-focus` thread fronts it through SkyLight (`_SLPSSetFrontProcessWithOptions` + make-key-window event records, WindowServer requests only, so a busy app cannot delay it), then a `ztab-raise-<pid>` thread of the target app sends `AXRaise` (unminimizing first when needed), so a raise stuck on one busy app never delays another app's. Each switch has a sequence number: a switch that a newer one replaced is skipped before it is fronted, and its raise stops before its next AX request once a newer switch has been fronted. An AX request already sent cannot be withdrawn, though: a busy app may apply an old raise after a newer switch. When that write returns late (or times out and the app answers again within 3 s), ZTab fronts and raises the newest window again if the old window, or its app, came out on top (checked then and 0.5 s later, within 5 s of the switch); a write applied even later is not covered. |
 | `src/thumbs.rs` | Asynchronous ScreenCaptureKit thumbnails with a per-window cache and one small priority scheduler (lost-focus captures, then switcher captures, then background refresh; at most 3 in flight, failures back off). |
-| `src/sysstate.rs` | Secure-input detection, session activity (screen lock, user idle) for the background-work pause, the main-thread stall detector, and app icons rasterised off the main thread. |
+| `src/sysstate.rs` | Secure-input detection, session activity (screen lock, user idle) for the background-work pause, the main-thread stall detector (with its escalation: an action on the watcher thread once one unit of work has run too long and is still running a moment later; `main` restarts ZTab with it), and app icons rasterised off the main thread. |
 | `src/ui.rs` | Non-activating `NSPanel` with a vibrancy background, one level above pop-up menus (the overlay level, 102). Grid of tiles: app groups never split across rows, an accent ring marks the selection, hover/click via a tracking area. The panel's content is a tree of Core Animation layers: the tint, group backgrounds, borders and selection ring are layer properties, and thumbnails, icons and one bitmap per tile label (small icon and title) are layer contents. The labels are rendered on a `ztab-labels` thread (AppKit string drawing into a bitmap, the text colour resolved for the panel's appearance, the icon's native small bitmap), queued when a session opens, both selected and not, for the screen it will show on, so the show delay absorbs them; they are cached (least recently used dropped beyond 12 MB). So the main thread rasterises nothing, the panel has no backing store to draw, and the window server composites it on the GPU. The panel is an 8-bit sRGB window and every bitmap it shows is sRGB, so Core Animation's commit hands the images over unconverted on any display; the window server matches the panel to each display. Between sessions the panel stays ordered in, transparent and click-through, so showing it sets its frame, its layers and its opacity without ordering a window in; 50 ms after a session ends it is ordered to the front of its level again (off the show path). Tile layers beyond the current session's tiles hold no images. (`drawRect:` remains for the `--snapshot` PNG and the `draw` measurement mode.) |
 | `src/settings.rs` | The settings values and their file, the isolated test location, the login agent (plist generation, `--set-login`), the first-launch rule (start at login once, see [above](#start-at-login-on-the-first-launch)), the `ztab-settings` writer thread and the single-instance lock. |
 | `src/settings_window.rs` | The Settings window and its shortcut recorders (AppKit, main thread); it only reports what the user did. |
-| `src/setup.rs` | First-run permissions without AppKit: when the Set up window opens, what its buttons do (the request APIs on a background thread, or the System Settings page), the status checks (off the main thread, plus a `ztab --screen-status` child process, since a process may keep its first Screen Recording answer), and the restart (`launchctl kickstart -k` for the login agent's ZTab, else a detached helper that starts the same bundle with the same arguments once this one has exited; a marker file reopens the window). |
+| `src/setup.rs` | First-run permissions without AppKit: when the Set up window opens, what its buttons do (the request APIs on a background thread, or the System Settings page), the status checks (off the main thread, plus a `ztab --screen-status` child process, since a process may keep its first Screen Recording answer), and the restart (`launchctl kickstart -k` for the login agent's ZTab, else a detached helper that starts the same bundle with the same arguments once this one has exited; a marker file reopens the window), also from a thread other than the main one when the main thread is stuck (it then ends the process with `_exit`). |
 | `src/setup_window.rs` | The Set up ZTab window (AppKit, main thread); it only reports what the user did. |
-| `src/main.rs` | App lifecycle, menu-bar item, the Set up window's wiring, session state machine, watchdog, background thumbnail refresh, applying settings, logging. |
+| `src/reopen.rs` | One ZTab per user (see [Opening ZTab](#opening-ztab)): the instance lock, the socket the running ZTab listens on (`dev.ztab.app.sock` next to the lock, mode 0600, `getpeereid` checked on both ends), the one-line request and answer, and a second process's decision (pure: how it was started, the answer, the lock holder's age, dry run) and its takeover (SIGTERM, then SIGKILL, only for a process of this user named `ztab` that has the lock file open, checked again right before each signal; never in a dry run). The listener thread hands each request to the main thread and answers only once the main thread took it (it answers `stalled` after 1.5 s), so a wedged ZTab is replaced, not trusted. "The same binary" means the same executable file (device, inode, size, modification time) as when the running ZTab started. Its self-check takes the lock first: it re-creates a removed socket file only while the lock is its own, and hands over to (and quits for) another ZTab that took the lock on a new file. |
+| `src/health.rs` | The health check's decisions (pure): which window shows the result, what is fixed, whether to restart, the status line; the health restart marker. |
+| `src/main.rs` | App lifecycle, menu-bar item, the Set up window's wiring, session state machine, watchdog, background thumbnail refresh, applying settings, logging; the app delegate (the reopen event), the health check's gathering and its status. |
 
 Nothing on the main thread waits on another app: no Accessibility call, no window-list or
 screen capture call, no icon loading and no disk write (the log has its own thread). The event
@@ -454,6 +527,8 @@ Normal`.
 | `e2e_quit <out> <ztab-pid>` | Clicks the menu-bar icon, then "Quit ZTab". |
 | `bench_switcher <out> holds\|cycles <n> [hold_ms]` | Not a test: holds ⌥Tab (Esc, no switch) n times and reports the `open:` / `panel shown:` timings ZTab logged (memory checks: `cycles 100`). |
 | `bench_churn <out> <scratch-dir> <rounds> <cycles>` | Not a test (memory checks): per round, opens two scratch Finder windows and a scratch TextEdit document, holds ⌥Tab `cycles` times (a real switch every tenth), and closes them again. |
+| Opening ZTab | The log says `launch: ByHand: the status is shown once ZTab is up` (or why not), `reopen: …` for every decision of a second process (`asking it`, the answer and the lock holder, `Shown` / `TakeOver` / `Report`, `sending SIGTERM to pid …`, `pid … exited … ms after SIGTERM; this ZTab holds the instance lock now`) and of the running ZTab (`reopen: ZTab … (pid …) was opened and asked this one: …`, `reopen: opened again (reopen event …)`), and `health (<trigger>): <findings> (checked off the main thread in <ms> ms)`, `health: plan: …`, `health: status shown in the Settings window (info\|warning): <text>`, `health: restarting ZTab (…)`. `ztab --reopen-check` asks the running ZTab as a probe and prints the answer, the lock holder and the decision of a dry run (it never takes the lock or stops anything, and the running ZTab answers without showing anything; against ZTab 0.2.3 or older: no answer, *dry run: would stop pid …*). `--takeover-dry-run` (or `ZTAB_TAKEOVER=dry-run`) makes a second process only report what it would do. `--opened-by-hand` counts a launch with arguments as one by hand (tests), `--background` the other way round. `--inject-health tap` makes the health check find the tap not answering (tests: one restart, then the warning). `--just-logged-in` makes ZTab take its own start as your login (tests of the quiet handling right after login: `launch: AtLogin: checked quietly …`, `health (…): quiet check (right after login): nothing wrong, nothing fixed: no window`). The launch event is logged as `launch event: aevt/oapp … (NSApplicationLaunchIsDefaultLaunchKey=…)`, with `(a login item)` when it carries the login-item mark. `--wedge-restart-s <s>` sets the stall watchdog's threshold (0: off; the log says `wedge watchdog: armed …` at launch and `wedge: the main thread has been stuck … restarting ZTab from the stall watcher's thread` when it acts). `ztab --reopen-selftest <scratch-dir>` runs, against child processes in that directory, the request, the answers (same binary, another binary, dry run, a wedged main thread, a stopped process, no listener, a holder that ignores SIGTERM), the takeover, the quiet requests right after login, a ZTab that lost its lock file handing over to the one that took it, and the stall watchdog (it fires once while a main run loop is stuck, not for a process stopped and continued, and its real restart starts the process again with the health marker); it prints `PASS`/`FAIL` per check. |
+| `e2e_reopen <out> windows <pid>` / `close <pid> <title>` | Not a test: reads a ZTab's windows and their message line through Accessibility, or closes one (for the reopen live check). |
 | Unit tests | `cargo test --bins` |
 
 ## Known limitations

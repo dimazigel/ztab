@@ -805,6 +805,29 @@ impl HotkeyHandle {
     pub fn location(&self) -> Option<CGEventTapLocation> {
         *self.shared.location.lock().unwrap_or_else(|e| e.into_inner())
     }
+    /// Health check (any thread but the tap's; blocks up to `timeout`): asks the tap's thread
+    /// whether the tap is enabled. `None`: the thread did not answer in time (or there is no tap
+    /// run loop). Costs the tap thread one tiny block.
+    pub fn probe(&self, timeout: std::time::Duration) -> Option<bool> {
+        let shared = self.shared;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        {
+            let rl = shared.run_loop.lock().unwrap_or_else(|e| e.into_inner());
+            let rl = rl.as_ref()?;
+            let block = RcBlock::new(move || {
+                let enabled = shared.tap().is_some_and(|t| CGEvent::tap_is_enabled(t));
+                let _ = tx.try_send(enabled);
+            });
+            // SAFETY: kCFRunLoopCommonModes is a valid static; the block captures a 'static
+            // reference and a channel sender.
+            unsafe {
+                let mode = kCFRunLoopCommonModes.map(|m| &**m);
+                rl.0.perform_block(mode, Some(&block));
+            }
+            rl.0.wake_up();
+        }
+        rx.recv_timeout(timeout).ok()
+    }
 }
 
 const ACCESSIBILITY_HINT: &str = "could not create the keyboard event tap: grant ZTab Accessibility \

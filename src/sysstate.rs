@@ -17,7 +17,7 @@ use std::ffi::{CStr, c_void};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -308,6 +308,46 @@ struct Watch {
     /// The kqueue the watcher waits on. The timer is armed, re-armed and deleted only under `m`,
     /// and the watcher closes the queue under `m` once `stop` is set.
     kq: i32,
+    /// See [`StallDetector::escalate`].
+    escalate: OnceLock<Escalate>,
+}
+
+/// What the watcher does about a unit of work that runs too long (see
+/// [`StallDetector::escalate`]).
+struct Escalate {
+    after: Duration,
+    confirm: Duration,
+    action: Box<dyn Fn(Duration) + Send + Sync>,
+}
+
+/// The watcher's escalation decision for the unit in progress (pure): `seen_past` is when the
+/// watcher first saw this unit past `after` (if it did), `fired` whether the action ran for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalateStep {
+    /// Not long enough yet: look again after this.
+    WaitFor(Duration),
+    /// Past `after` for the first time: confirm, i.e. look again after `confirm` (a process that
+    /// was stopped, SIGSTOP or a debugger, comes back with a huge elapsed time once; its unit
+    /// then ends at once).
+    Confirm(Duration),
+    /// Still the same unit `confirm` after it was first seen past `after`: act.
+    Act,
+    /// Acted already for this unit (once per unit), or no escalation.
+    Done,
+}
+
+pub fn escalate_step(elapsed: Duration, after: Duration, confirm: Duration, seen_past: Option<Instant>, fired: bool, now: Instant) -> EscalateStep {
+    if fired {
+        return EscalateStep::Done;
+    }
+    if elapsed < after {
+        return EscalateStep::WaitFor(after - elapsed);
+    }
+    match seen_past {
+        Some(t) if now.saturating_duration_since(t) >= confirm => EscalateStep::Act,
+        Some(t) => EscalateStep::Confirm(confirm - now.saturating_duration_since(t)),
+        None => EscalateStep::Confirm(confirm),
+    }
 }
 
 #[derive(Default)]
@@ -328,7 +368,7 @@ impl Watch {
     fn new() -> Option<Watch> {
         // SAFETY: plain system call.
         let kq = unsafe { libc::kqueue() };
-        (kq >= 0).then(|| Watch { m: Mutex::new(WatchState::default()), kq })
+        (kq >= 0).then(|| Watch { m: Mutex::new(WatchState::default()), kq, escalate: OnceLock::new() })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, WatchState> {
@@ -473,8 +513,13 @@ fn activity_name(a: CFRunLoopActivity) -> &'static str {
 
 /// The run-loop watcher thread: waits on the kqueue timer the main thread arms, which fires only
 /// when a unit of work has run for 1 s (then 2 s, 4 s...), and logs that it is still running.
+/// With an escalation ([`StallDetector::escalate`]) it also wakes up when a unit reaches its
+/// `after`, and runs its action (on this thread) once the unit is confirmed still running.
 fn watch_thread(watch: Arc<Watch>, log: fn(&str)) {
     let mut noted: Option<(Instant, Duration)> = None;
+    // The unit the escalation saw past `after` (and when), and the unit it acted for.
+    let mut seen_past: Option<(Instant, Instant)> = None;
+    let mut fired_for: Option<Instant> = None;
     loop {
         // SAFETY: zeroed kevent is a valid out value.
         let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
@@ -497,14 +542,48 @@ fn watch_thread(watch: Arc<Watch>, log: fn(&str)) {
             _ => STILL_BLOCKED_FIRST,
         };
         let elapsed = start.elapsed();
+        let mut wake;
+        let mut note = None;
         if elapsed >= next {
-            noted = Some((start, next * 2));
-            watch.set_timer(&mut st, Some(next * 2 - elapsed));
-            drop(st);
-            log(&format!("main thread still blocked: {} ms", elapsed.as_millis()));
+            // The next note at the next doubling past `elapsed` (a watcher that was stopped with
+            // the process wakes up late).
+            let mut n = next * 2;
+            while n <= elapsed {
+                n *= 2;
+            }
+            noted = Some((start, n));
+            wake = n - elapsed;
+            note = Some(elapsed);
         } else {
             // A later unit of the same pass: wait for the rest of its first second.
-            watch.set_timer(&mut st, Some(next - elapsed));
+            wake = next - elapsed;
+        }
+        let mut act = None;
+        if let Some(e) = watch.escalate.get() {
+            let now = Instant::now();
+            let seen = seen_past.filter(|(u, _)| *u == start).map(|(_, t)| t);
+            match escalate_step(elapsed, e.after, e.confirm, seen, fired_for == Some(start), now) {
+                EscalateStep::WaitFor(d) => wake = wake.min(d),
+                EscalateStep::Confirm(d) => {
+                    if seen.is_none() {
+                        seen_past = Some((start, now));
+                    }
+                    wake = wake.min(d);
+                }
+                EscalateStep::Act => {
+                    fired_for = Some(start);
+                    act = Some(elapsed);
+                }
+                EscalateStep::Done => {}
+            }
+        }
+        watch.set_timer(&mut st, Some(wake.max(Duration::from_millis(1))));
+        drop(st);
+        if let Some(elapsed) = note {
+            log(&format!("main thread still blocked: {} ms", elapsed.as_millis()));
+        }
+        if let (Some(elapsed), Some(e)) = (act, watch.escalate.get()) {
+            (e.action)(elapsed);
         }
     }
 }
@@ -665,6 +744,15 @@ impl StallDetector {
     /// Run-loop mode: how often the watcher thread has woken up (0 in probe mode).
     pub fn watcher_wakeups(&self) -> u64 {
         self.watch.as_ref().map_or(0, |w| w.lock().wakeups)
+    }
+
+    /// Run-loop mode: when one unit of work has run for `after` and is still the same unit
+    /// `confirm` later, call `action(elapsed)` on the watcher thread, once per unit (the main
+    /// thread is stuck: the action must not need it). Nothing extra runs while units stay short:
+    /// the watcher wakes up only for a unit that runs 1 s or more. Set once; `false` in probe mode
+    /// or when one is set already.
+    pub fn escalate(&self, after: Duration, confirm: Duration, action: Box<dyn Fn(Duration) + Send + Sync>) -> bool {
+        self.watch.as_ref().is_some_and(|w| w.escalate.set(Escalate { after, confirm, action }).is_ok())
     }
 }
 
@@ -980,5 +1068,53 @@ mod tests {
         assert_eq!(ms.len(), 2, "one log line per stall: {lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("main thread still blocked: ")), "a long stall is reported while it lasts: {lines:?}");
         assert!(units > 5, "{units} units");
+    }
+
+    #[test]
+    fn escalation_waits_confirms_then_acts_once() {
+        let (after, confirm) = (Duration::from_secs(15), Duration::from_secs(1));
+        let now = Instant::now();
+        let s = |e: u64, seen: Option<Instant>, fired: bool| escalate_step(Duration::from_secs(e), after, confirm, seen, fired, now);
+        assert_eq!(s(4, None, false), EscalateStep::WaitFor(Duration::from_secs(11)));
+        assert_eq!(s(15, None, false), EscalateStep::Confirm(confirm), "first seen past the threshold: confirm first");
+        // A process that was stopped for a minute comes back with a huge elapsed time: confirm,
+        // never act at once.
+        assert_eq!(s(60, None, false), EscalateStep::Confirm(confirm));
+        assert_eq!(s(16, Some(now - Duration::from_millis(300)), false), EscalateStep::Confirm(Duration::from_millis(700)));
+        assert_eq!(s(16, Some(now - confirm), false), EscalateStep::Act);
+        assert_eq!(s(40, Some(now - confirm * 5), true), EscalateStep::Done, "once per unit");
+    }
+
+    #[test]
+    fn escalation_fires_once_for_a_stuck_unit_and_never_for_short_ones() {
+        static FIRED: Mutex<Vec<u128>> = Mutex::new(Vec::new());
+        let r = std::thread::spawn(|| {
+            let rl = CFRunLoop::current().unwrap();
+            let keep = RcBlock::new(|_t: *mut CFRunLoopTimer| {});
+            // SAFETY: as in `blocking_timer`.
+            let t = unsafe { CFRunLoopTimer::with_handler(None, CFAbsoluteTimeGetCurrent() + 3600.0, 3600.0, 0, 0, Some(&keep)) }.unwrap();
+            rl.add_timer(Some(&t), unsafe { kCFRunLoopDefaultMode });
+            // Its own log: `capture` is shared with the other run-loop test (run in parallel).
+            fn nolog(_: &str) {}
+            let det = StallDetector::observe(&rl, Duration::from_millis(50), None, nolog);
+            assert!(det.escalate(Duration::from_millis(1200), Duration::from_millis(300), Box::new(|e| FIRED.lock().unwrap().push(e.as_millis()))));
+            assert!(!det.escalate(Duration::from_secs(1), Duration::from_secs(1), Box::new(|_| {})), "set once");
+            // Units shorter than the threshold (one of them long enough to wake the watcher).
+            blocking_timer(&rl, 300);
+            run_for(0.5);
+            blocking_timer(&rl, 1100);
+            run_for(1.4);
+            let short = FIRED.lock().unwrap().clone();
+            // Past the threshold and still running when it is confirmed: once.
+            blocking_timer(&rl, 2600);
+            run_for(2.9);
+            (short, FIRED.lock().unwrap().clone())
+        })
+        .join()
+        .unwrap();
+        let (short, all) = r;
+        assert!(short.is_empty(), "short units never escalate: {short:?}");
+        assert_eq!(all.len(), 1, "once per unit: {all:?}");
+        assert!((1450..2400).contains(&all[0]), "after the threshold and the confirmation: {all:?}");
     }
 }

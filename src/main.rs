@@ -15,8 +15,10 @@
 //! (thumbnail refresh, the model's safety-net rescans) pauses while nobody can see the screen or
 //! the user is away, and the periodic timers slow down meanwhile.
 
+mod health;
 mod hotkey;
 mod model;
+mod reopen;
 mod settings;
 mod settings_window;
 mod setup;
@@ -42,7 +44,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
     NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSWorkspace,
     NSWorkspaceScreensDidSleepNotification, NSWorkspaceScreensDidWakeNotification,
     NSWorkspaceSessionDidBecomeActiveNotification, NSWorkspaceSessionDidResignActiveNotification,
@@ -162,8 +164,12 @@ fn write_log_line(ts: f64, msg: &str) {
     if std::fs::metadata(&path).map(|m| m.len() >= LOG_MAX_BYTES).unwrap_or(false) {
         let _ = std::fs::rename(&path, format!("{path}.1"));
     }
+    // One write(2) per line on an O_APPEND file: a second ZTab process (a reopen request, a
+    // takeover) logs at the same time, and `writeln!` on an unbuffered File issues one write
+    // per formatted piece, which interleaved the two processes' lines.
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "[{ts:.3}] {msg}");
+        let line = format!("[{ts:.3}] {msg}\n");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -350,6 +356,44 @@ struct State {
     /// can arrive in the middle of it).
     own_closed: Cell<[bool; 2]>,
     setup: RefCell<SetupCtl>,
+    /// The health check run when ZTab is opened by hand (see `health_check`).
+    health: RefCell<HealthCtl>,
+    /// The Settings window shows a health status: the login state read afterwards does not
+    /// replace it with its warning (the status says it). Until the window closes.
+    status_shown: Cell<bool>,
+    /// When the window model was started (the health check notes a model not ready for long).
+    model_started_at: Cell<Option<Instant>>,
+}
+
+/// What started a health check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    /// A launch by hand (or after a health restart).
+    Launch,
+    /// The reopen event: the user opened this same copy again (Finder, Spotlight, `open`).
+    Reopen,
+    /// A second process (pid) asked through the socket: the same binary, or one that asked this
+    /// one to stay (right after login, or a ZTab that lost its lock file handing over).
+    Request(i32),
+}
+
+/// The health check's state (see `State::health_check`).
+#[derive(Default)]
+struct HealthCtl {
+    /// A check is under way; `again` asks for another once it is done.
+    running: bool,
+    again: Option<Trigger>,
+    /// The check under way shows its result even when all is well (one trigger was not quiet;
+    /// see `health::Feedback`).
+    show: bool,
+    /// Re-runs while the tap was being installed.
+    tap_waits: u32,
+    /// This process comes from a health restart (its reason): no second restart for the tap.
+    restarted_for: Option<String>,
+    /// What this launch did that the first status shows (a takeover, a health restart).
+    launch_notes: Vec<String>,
+    /// `--inject-health tap` (tests): the tap counts as not responding.
+    inject_tap: bool,
 }
 
 /// The Set up window's state (see `setup.rs`).
@@ -487,6 +531,7 @@ impl State {
         }));
         m.set_paused(self.paused.get().is_some(), false);
         *self.model.borrow_mut() = Some(m);
+        self.model_started_at.set(Some(Instant::now()));
         log("window model started");
         // ZTab's windows already open (the Set up window, when Accessibility was granted while it
         // was open) are listed from now on.
@@ -1379,6 +1424,8 @@ impl State {
     /// Menu "Settings…": build the window the first time, show the current values, bring it to
     /// the front (activate, then make it key).
     fn show_settings(&self) {
+        // A health status, if any, is set again by its caller after this.
+        self.status_shown.set(false);
         let win = self.build_settings_window("on first open");
         win.set_values(&self.settings.borrow());
         let (msg, kind) = self.login_note.borrow().settings();
@@ -1491,7 +1538,8 @@ impl State {
                 let Some(st) = state() else { return };
                 if let Some(w) = st.settings_window() {
                     w.set_login(Some(ls.checked()));
-                    if let Some(msg) = login_warning(&ls) {
+                    // A health status shown meanwhile already says what the login item does.
+                    if let Some(msg) = login_warning(&ls).filter(|_| !st.status_shown.get()) {
                         w.set_message(&msg, MsgKind::Warning);
                     }
                 }
@@ -1731,6 +1779,7 @@ impl State {
             SettingsEvent::Moved => self.update_own_windows(),
             SettingsEvent::Closing => {
                 win.stop_recording();
+                self.status_shown.set(false);
                 let wid = win.window().windowNumber();
                 self.set_own_closed(OwnWin::Settings, true);
                 self.update_own_windows();
@@ -2169,15 +2218,14 @@ impl State {
     /// Restart ZTab (see `setup::relaunch_plan`): the new ZTab opens the window again (marker).
     /// Off the main thread: the marker, the plan and launchctl or the helper.
     fn restart_for_setup(&self, why: &str) {
-        if std::mem::replace(&mut self.setup.borrow_mut().restarting, true) {
-            return;
-        }
-        if let Some(w) = self.setup_window() {
-            w.set_message("Restarting ZTab…", MsgKind::Info);
-        }
+        self.restart_self(why, None, None);
+    }
+
+    /// What a restart runs: `$XPC_SERVICE_NAME` for `setup::relaunch_plan` and the arguments.
+    /// Isolated through $ZTAB_SETTINGS_DIR (the restarted ZTab does not inherit it): kept isolated
+    /// with the flag, and never restarted through the (user's) login agent.
+    fn restart_args(&self) -> (Option<String>, Vec<String>) {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
-        // Isolated through $ZTAB_SETTINGS_DIR (the restarted ZTab does not inherit it): keep it
-        // isolated with the flag, and never through the (user's) login agent.
         let mut xpc = std::env::var("XPC_SERVICE_NAME").ok();
         if self.paths.isolated {
             xpc = None;
@@ -2188,50 +2236,86 @@ impl State {
                 args.push(dir.to_string_lossy().into_owned());
             }
         }
+        (xpc, args)
+    }
+
+    /// The stall watcher restarts ZTab when its main thread has been stuck in one unit of work
+    /// for `after` and still is a second later (`sysstate::StallDetector::escalate`): the reopen
+    /// event of a ZTab opened again while stuck lands on that stuck thread, and nothing else
+    /// would end it. The restarted ZTab shows its status, saying it restarted and why. After
+    /// such a restart it does not restart for this again within `WEDGE_REPEAT_GUARD_S`.
+    fn arm_wedge_watchdog(&self, after: Duration) {
+        let (xpc, args) = self.restart_args();
+        let exe = std::env::current_exe().map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default();
+        let fallback_exe = Some(std::path::PathBuf::from(&reopen::identity().stable));
+        let w = setup::WedgeRestart { xpc, exe, fallback_exe, args, marker: health::marker_path(), log, flush: flush_log };
+        let action = Box::new(move |blocked: Duration| {
+            let at = WEDGE_RESTARTED_AT_MS.load(Ordering::SeqCst);
+            let ago_s = now_ms().saturating_sub(at) as f64 / 1000.0;
+            if at > 0 && ago_s < WEDGE_REPEAT_GUARD_S {
+                log(&format!(
+                    "wedge: the main thread has been stuck for {:.1} s; not restarting: this ZTab comes from a restart for that {ago_s:.0} s ago",
+                    blocked.as_secs_f64()
+                ));
+                return;
+            }
+            setup::wedge_restart(&w, blocked, now_secs());
+        });
+        // The run-loop detector comes first (`start_stall_detector`); a probe one cannot escalate.
+        let armed = self.stall.borrow().first().is_some_and(|d| d.escalate(after, WEDGE_CONFIRM, action));
+        log(&format!(
+            "wedge watchdog: {} (main thread stuck in one unit of work for {:.0} s, and still {} ms later: ZTab restarts itself)",
+            if armed { "armed" } else { "not armed (no run-loop stall detector)" },
+            after.as_secs_f64(),
+            WEDGE_CONFIRM.as_millis()
+        ));
+    }
+
+    /// Restart ZTab: for the Set up window (`health` None: its marker makes the new ZTab open
+    /// that window again), or for a health check (`health`: the reason; its marker makes the new
+    /// ZTab show its status, saying why it restarted, and keeps it from restarting again for the
+    /// tap). Isolated settings stay isolated and never go through the user's login agent.
+    /// `exe`: start this binary (the path ZTab is opened by, when another binary was installed
+    /// there) instead of this process's own (which an upgrade may have removed).
+    fn restart_self(&self, why: &str, health: Option<String>, exe: Option<std::path::PathBuf>) {
+        if std::mem::replace(&mut self.setup.borrow_mut().restarting, true) {
+            return;
+        }
+        if health.is_none()
+            && let Some(w) = self.setup_window()
+        {
+            w.set_message("Restarting ZTab…", MsgKind::Info);
+        }
+        let (xpc, args) = self.restart_args();
         // Whether Screen Recording was seen granted: then the new ZTab does not restart itself
         // for it again (see `setup::should_auto_restart`).
         let screen_seen = self.setup.borrow().last.is_some_and(|p| p.screen());
-        log(&format!("setup: restarting ZTab ({why}); XPC_SERVICE_NAME={xpc:?}; screen recording seen={screen_seen}"));
+        let who = if health.is_some() { "health" } else { "setup" };
+        log(&format!("{who}: restarting ZTab ({why}); XPC_SERVICE_NAME={xpc:?}; screen recording seen={screen_seen}"));
         let spawned = std::thread::Builder::new().name("ztab-restart".into()).spawn(move || {
             let uid = unsafe { libc::getuid() };
-            let exe = std::env::current_exe().map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default();
-            if let Err(e) = setup::write_marker(&setup::marker_path(), now_secs(), screen_seen) {
-                log(&format!("setup: could not write the reopen marker: {e}"));
+            let exe = exe.unwrap_or_else(|| std::env::current_exe().map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default());
+            let marker = match &health {
+                None => setup::write_marker(&setup::marker_path(), now_secs(), screen_seen),
+                Some(reason) => health::write_marker(&health::marker_path(), now_secs(), reason),
+            };
+            if let Err(e) = marker {
+                log(&format!("{who}: could not write the restart marker: {e}"));
             }
-            let plan = setup::relaunch_plan(xpc.as_deref(), uid, &exe, &args);
-            log(&format!("setup: restart plan {plan:?}"));
-            log_flush(Duration::from_millis(500));
-            let kickstart = matches!(plan, setup::Relaunch::Kickstart { .. });
-            match setup::spawn_relaunch(&plan) {
-                Ok(what) if kickstart => {
-                    log(&format!("setup: {what}: launchd stops this ZTab and starts it again"));
-                    log_flush(Duration::from_millis(500));
-                    std::thread::sleep(Duration::from_secs(5));
-                    log("setup: still running 5 s after launchctl kickstart; restarting it directly");
-                }
-                Ok(what) => {
-                    log(&format!("setup: {what}; exiting"));
-                    DispatchQueue::main().exec_async(|| exit_now(0));
-                    return;
-                }
-                Err(e) => log(&format!("setup: restart failed: {e}")),
-            }
-            if kickstart {
-                let plan = setup::relaunch_plan(None, uid, &exe, &args);
-                match setup::spawn_relaunch(&plan) {
-                    Ok(what) => {
-                        log(&format!("setup: {what}; exiting"));
-                        DispatchQueue::main().exec_async(|| exit_now(0));
-                        return;
-                    }
-                    Err(e) => log(&format!("setup: restart failed: {e}")),
-                }
+            let flush = || log_flush(Duration::from_millis(500));
+            let exit = || DispatchQueue::main().exec_async(|| exit_now(0));
+            if setup::relaunch_then_exit(xpc.as_deref(), uid, &exe, &args, who, log, &flush, &exit).is_ok() {
+                return;
             }
             DispatchQueue::main().exec_async(|| {
                 let Some(st) = state() else { return };
                 st.setup.borrow_mut().restarting = false;
-                if let Some(w) = st.setup_window() {
-                    w.set_message("ZTab could not restart itself (see ~/Library/Logs/ztab.log). Quit it and open it again.", MsgKind::Error);
+                let msg = "ZTab could not restart itself (see ~/Library/Logs/ztab.log). Quit it and open it again.";
+                if let Some(w) = st.setup_window().filter(|w| w.is_visible()) {
+                    w.set_message(msg, MsgKind::Error);
+                }
+                if let Some(w) = st.settings_window().filter(|w| w.is_visible()) {
+                    w.set_message(msg, MsgKind::Error);
                 }
             });
         });
@@ -2240,6 +2324,508 @@ impl State {
             self.setup.borrow_mut().restarting = false;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opened by hand: the health check and its status (see health.rs, reopen.rs)
+// ---------------------------------------------------------------------------------------------
+
+/// The health check's tap probe: how long the tap thread gets to answer.
+const TAP_PROBE_WAIT: Duration = Duration::from_millis(500);
+/// The main thread stuck in one unit of work this long (`--wedge-restart-s`; 0: never), and still
+/// [`WEDGE_CONFIRM`] later: ZTab restarts itself (`State::arm_wedge_watchdog`). The longest
+/// real stall in the logs so far is about 0.1 s; tests inject up to 9 s.
+const WEDGE_RESTART_S: f64 = 15.0;
+const WEDGE_CONFIRM: Duration = Duration::from_secs(1);
+/// After a restart for a stuck main thread, the restarted ZTab does not restart for that again
+/// for this long (no restart loop when it gets stuck at once again).
+const WEDGE_REPEAT_GUARD_S: f64 = 600.0;
+/// When this process was started by a restart for a stuck main thread (unix ms; 0: it was not).
+static WEDGE_RESTARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Write out the log (a restart off the main thread, before it ends this process).
+fn flush_log() {
+    log_flush(Duration::from_millis(500));
+}
+
+/// The listener's self-check found that another ZTab holds the instance lock now and answers
+/// (this one lost its lock file): quit, so that one ZTab runs.
+fn quit_for_holder(why: &str) {
+    log(&format!("reopen: {why}"));
+    DispatchQueue::main().exec_async(|| exit_now(0));
+}
+/// Re-runs of the check while the tap is being installed (every 500 ms).
+const TAP_START_WAITS: u32 = 6;
+
+impl State {
+    /// ZTab was opened by hand (`trigger`): check that everything works, fix what can be fixed
+    /// and show the result (the Settings window with a status line, or the Set up window when a
+    /// permission is missing), or restart once when the event tap does not work. The checks that
+    /// can block (permissions, the tap thread, the login agent, the lock and socket files) run
+    /// off the main thread; this only reads ZTab's own state. While a switcher session is open it
+    /// waits (250 ms at a time), so it never comes between the user and ⌥Tab. `quiet` (right after
+    /// login): everything is checked and repaired the same, but a window opens only when something
+    /// is wrong or was fixed (`health::worth_showing`).
+    fn health_check(&self, trigger: Trigger, quiet: bool) {
+        if self.active.get() {
+            log(&format!("health ({trigger:?}): postponed (switcher open)"));
+            after_on_main(Duration::from_millis(250), move || {
+                if let Some(st) = state() {
+                    st.health_check(trigger, quiet);
+                }
+            });
+            return;
+        }
+        {
+            let mut h = self.health.borrow_mut();
+            if h.running {
+                h.again = Some(trigger);
+                h.show |= !quiet;
+                log(&format!("health ({trigger:?}): a check is under way; it shows its result{}", if h.show { "" } else { " if something is wrong" }));
+                return;
+            }
+            h.running = true;
+            h.show = !quiet;
+        }
+        // What the watchdog does every 1.5 s, done now: the tap and the window model start once
+        // Accessibility is granted.
+        self.try_install_hotkey();
+        let hk = self.hk_handle.get();
+        let installing = self.hk_installing.get();
+        let model = match self.model() {
+            None => health::Model::NotStarted,
+            Some(m) if m.ready() => health::Model::Ready { windows: m.snapshot().windows.len() },
+            Some(_) => health::Model::Starting { secs: self.model_started_at.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0) },
+        };
+        let longest_stall_ms = self.stall.borrow().iter().map(|d| d.stalls().1).fold(0.0, f64::max);
+        let secure_input = self.secure.borrow().as_ref().map(|s| s.app_name.clone());
+        let skip_screen = self.settings.borrow().skip_screen_recording;
+        let (screen_at_launch, restart_saw_screen) = {
+            let c = self.setup.borrow();
+            (c.screen_at_launch, c.restart_saw_screen)
+        };
+        let (restarted_by_health, launch_notes, inject_tap) = {
+            let h = self.health.borrow();
+            (h.restarted_for.is_some(), h.launch_notes.clone(), h.inject_tap)
+        };
+        // The login agent on the settings thread (in order with the checkbox's writes): pointed
+        // at this copy when it starts another one, only if it is on and this copy is installed.
+        let (ltx, lrx) = mpsc::sync_channel::<health::Login>(1);
+        let paths = self.paths.clone();
+        let program = settings::current_program();
+        self.writer.run(move || {
+            let state = paths.login_state(&program);
+            let placement = settings::install_placement(&program, settings::read_only_volume(&program));
+            let login = match (health::login_repair(&state, placement), state) {
+                (health::LoginRepair::Repoint, settings::LoginState::Elsewhere { program: from, exists }) => {
+                    match paths.set_login_file(true, &program) {
+                        Ok(()) => {
+                            log(&format!(
+                                "health: start at login started {from} ({}); {} now starts {program}",
+                                if exists { "another copy" } else { "a removed copy" },
+                                paths.agent_plist.display()
+                            ));
+                            health::Login::Repointed { from, existed: exists }
+                        }
+                        Err(e) => health::Login::RepointFailed { from, error: e.to_string() },
+                    }
+                }
+                (health::LoginRepair::Leave(why), settings::LoginState::Elsewhere { program, exists }) => {
+                    health::Login::LeftElsewhere { program, exists, why }
+                }
+                (_, settings::LoginState::On) => health::Login::On,
+                _ => health::Login::Off,
+            };
+            let _ = ltx.send(login);
+        });
+        let exe = std::env::current_exe().unwrap_or_default();
+        let t = Instant::now();
+        let spawned = std::thread::Builder::new().name("ztab-health".into()).spawn(move || {
+            let polled = setup::poll(&exe, true);
+            let tap = if !polled.ax {
+                health::Tap::NoAccess
+            } else if let Some(h) = hk {
+                match h.probe(TAP_PROBE_WAIT) {
+                    _ if inject_tap => health::Tap::Installed { was_enabled: true, enabled: true, responsive: false },
+                    None => health::Tap::Installed { was_enabled: false, enabled: false, responsive: false },
+                    Some(true) => health::Tap::Installed { was_enabled: true, enabled: true, responsive: true },
+                    Some(false) => {
+                        h.reenable();
+                        std::thread::sleep(Duration::from_millis(200));
+                        let now = h.probe(TAP_PROBE_WAIT);
+                        health::Tap::Installed { was_enabled: false, enabled: now == Some(true), responsive: now.is_some() }
+                    }
+                }
+            } else if installing {
+                health::Tap::Starting
+            } else {
+                health::Tap::Missing
+            };
+            let (lock, socket) = reopen::check_ipc();
+            if matches!(lock, reopen::LockCheck::OtherHolder(_))
+                && let Some(pid) = reopen::yield_to_holder(&reopen::Ipc::user(), true, quiet, log)
+            {
+                // This ZTab lost its lock file and another one runs with the lock: that one shows
+                // its status; this one quits, so that one ZTab runs.
+                log(&format!("health ({trigger:?}): another ZTab (pid {pid}) holds the instance lock now and shows its status: quitting"));
+                DispatchQueue::main().exec_async(|| exit_now(0));
+                return;
+            }
+            let login = lrx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
+                log("health: the login agent was not checked within 3 s (settings thread busy)");
+                health::Login::Off
+            });
+            let inputs = health::Inputs {
+                ax: polled.ax,
+                screen_now: polled.screen(),
+                screen_at_launch,
+                skip_screen,
+                restart_saw_screen,
+                tap,
+                restarted_by_health,
+                replaced: reopen::replaced_on_disk(reopen::identity()),
+                secure_input,
+                model,
+                longest_stall_ms,
+                login,
+                lock,
+                socket,
+                launch_notes,
+            };
+            let plan = health::plan(&inputs);
+            let ms = ms_since(t);
+            DispatchQueue::main().exec_async(move || {
+                if let Some(st) = state() {
+                    st.apply_health(trigger, inputs, plan, ms);
+                }
+            });
+        });
+        if let Err(e) = spawned {
+            log(&format!("health: could not start the check thread: {e}"));
+            self.health.borrow_mut().running = false;
+            self.show_settings();
+        }
+    }
+
+    /// Carry out a health plan (main thread): log it, start what is not running, then restart,
+    /// or show the Set up window or the status.
+    fn apply_health(&self, trigger: Trigger, inputs: health::Inputs, plan: health::Plan, ms: f64) {
+        log(&format!("health ({trigger:?}): {} (checked off the main thread in {ms:.0} ms)", health::describe(&inputs)));
+        let again = {
+            let mut h = self.health.borrow_mut();
+            h.running = false;
+            let again = h.again.take();
+            let show = h.show;
+            if inputs.tap == health::Tap::Starting && h.tap_waits < TAP_START_WAITS {
+                h.tap_waits += 1;
+                drop(h);
+                log("health: the tap is being installed; checking again in 500 ms");
+                after_on_main(Duration::from_millis(500), move || {
+                    if let Some(st) = state() {
+                        st.health_check(trigger, !show);
+                    }
+                });
+                return;
+            }
+            if self.active.get() {
+                drop(h);
+                // ⌥Tab was pressed meanwhile: show nothing now; check again after the session.
+                log("health: a switcher session opened meanwhile; checking again after it");
+                self.health_check(trigger, !show);
+                return;
+            }
+            h.tap_waits = 0;
+            if !show && !health::worth_showing(&plan) {
+                // Quiet (right after login): all is well, nothing to show. The launch notes stay
+                // for the next status.
+                drop(h);
+                if plan.start_model {
+                    self.ensure_model(false);
+                }
+                log(&format!(
+                    "health ({trigger:?}): quiet check (right after login): nothing wrong, nothing fixed: no window (notes: {:?})",
+                    plan.notes
+                ));
+                return;
+            }
+            // The notes of this launch are shown once.
+            h.launch_notes.clear();
+            again
+        };
+        if plan.start_model {
+            self.ensure_model(false);
+        }
+        log(&format!(
+            "health: plan: ui={:?} restart={:?} fixed={:?} problems={:?} notes={:?}",
+            plan.ui, plan.restart, plan.fixed, plan.problems, plan.notes
+        ));
+        match &plan.restart {
+            Some(health::Restart::ScreenRecording) => {
+                // Seen granted (the new ZTab does not restart for it again); the Set up window
+                // reopens there with the result.
+                self.setup.borrow_mut().last = Some(setup::Polled {
+                    ax: inputs.ax,
+                    screen_here: false,
+                    screen_child: Some(true),
+                    ax_ms: 0.0,
+                    screen_ms: 0.0,
+                    child_ms: None,
+                });
+                self.restart_for_setup(&format!("opened by hand ({trigger:?}): Screen Recording was granted after launch"));
+                return;
+            }
+            Some(health::Restart::Tap(why)) => {
+                self.show_status(&plan);
+                self.restart_self(&format!("opened by hand ({trigger:?}): {why}"), Some(why.clone()), None);
+                return;
+            }
+            Some(health::Restart::Replaced(path)) => {
+                self.show_status(&plan);
+                let why = format!("another ZTab binary was installed at {path}");
+                self.restart_self(&format!("opened by hand ({trigger:?}): {why}"), Some(why), Some(std::path::PathBuf::from(path)));
+                return;
+            }
+            None => {}
+        }
+        match plan.ui {
+            health::Ui::Setup(why) => self.show_setup(&format!("opened by hand ({trigger:?}): {why}")),
+            health::Ui::Settings => self.show_status(&plan),
+        }
+        if let Some(t) = again
+            && t != trigger
+        {
+            log(&format!("health: another check was asked for meanwhile ({t:?}); its window is open already"));
+        }
+    }
+
+    /// The Settings window with the health status as its message (and the first-launch note).
+    fn show_status(&self, plan: &health::Plan) {
+        let b = self.settings.borrow().hotkeys.all;
+        let shortcut = format!("hold {} and press {}", b.hold.symbol(), hotkey::key_name(b.key));
+        let (mut msg, warn) = health::message(plan, &shortcut);
+        let (note, _) = self.login_note.borrow().settings();
+        if !note.is_empty() {
+            msg = format!("{msg} {note}");
+        }
+        self.show_settings();
+        self.status_shown.set(true);
+        if let Some(w) = self.settings_window() {
+            w.set_message(&msg, if warn { MsgKind::Warning } else { MsgKind::Info });
+        }
+        log(&format!("health: status shown in the Settings window ({}): {msg}", if warn { "warning" } else { "info" }));
+    }
+}
+
+/// A second ZTab asks through the socket (listener thread): handled on the main thread; the
+/// listener answers the second process only once this block ran (a wedged main thread does not
+/// answer, and is then replaced).
+fn on_reopen_request(req: reopen::Request, resp: reopen::Responder) {
+    DispatchQueue::main().exec_async(move || {
+        let id = reopen::identity();
+        let status = reopen::server_status(&id.binid, &req);
+        let st = state();
+        let deferred = st.as_ref().is_some_and(|s| s.active.get());
+        let main_ms = resp.received.elapsed().as_secs_f64() * 1000.0;
+        let reply = reopen::Reply {
+            pid: id.pid,
+            exe: id.exe.clone(),
+            binid: id.binid.clone(),
+            version: id.version.clone(),
+            status,
+            main_ms,
+            deferred,
+        };
+        if !resp.reply(reply) {
+            log(&format!("reopen: the request of pid {} reached the main thread after {main_ms:.0} ms, too late: it takes over", req.pid));
+            return;
+        }
+        if req.probe {
+            log(&format!("reopen: pid {} asked as a probe (ztab --reopen-check): answered {status:?} in {main_ms:.1} ms; nothing done", req.pid));
+            return;
+        }
+        log(&format!(
+            "reopen: ZTab {} (pid {}, {}) was opened and asked this one: {} (main thread took it in {main_ms:.1} ms{})",
+            req.version,
+            req.pid,
+            req.exe,
+            match (status, req.quiet) {
+                (reopen::Status::Show, false) if reopen::same_binary(&id.binid, &req.binid) => "the same binary: checking and showing the status",
+                (reopen::Status::Show, false) => "another binary that asked this one to stay: checking and showing the status",
+                (reopen::Status::Show, true) =>
+                    "opened right after login: checking quietly (a window only if something is wrong or was fixed)",
+                (reopen::Status::Quitting, _) => "another binary: quitting so that it takes over",
+                (reopen::Status::Staying, _) => "another binary, dry run: this ZTab would quit; it stays",
+            },
+            if deferred { "; a switcher session is open" } else { "" }
+        ));
+        match status {
+            reopen::Status::Show => {
+                if let Some(st) = st {
+                    st.health_check(Trigger::Request(req.pid), req.quiet);
+                }
+            }
+            reopen::Status::Quitting => after_on_main(Duration::from_millis(300), || exit_now(0)),
+            reopen::Status::Staying => {}
+        }
+    });
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "ZTabAppDelegate"]
+    #[ivars = ()]
+    struct AppDelegate;
+
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        /// The user opened this copy again while it runs (Finder, Spotlight, Launchpad, `open`):
+        /// macOS activates ZTab and sends this. Always checked; right after login (where it may
+        /// be a login item rather than the user) quietly: a window only if something is wrong or
+        /// was fixed.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _app: &NSApplication, visible: bool) -> bool {
+            let since = reopen::secs_since_login();
+            let ev = current_apple_event();
+            let quiet = reopen::just_logged_in(since) || ev.as_ref().is_some_and(|e| e.login_item);
+            log(&format!(
+                "reopen: opened again (reopen event {}; visible windows: {visible}){}",
+                ev.as_ref().map(|e| e.describe()).unwrap_or_else(|| "?".into()),
+                if quiet {
+                    format!(
+                        ": {:.0} s after login, maybe a login item: checking quietly (a window only if something is wrong or was fixed)",
+                        since.unwrap_or(0.0)
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+            if let Some(st) = state() {
+                st.health_check(Trigger::Reopen, quiet);
+            }
+            false
+        }
+
+        /// The launch's `oapp` event is the current Apple event here: whether a login item (or a
+        /// service) started ZTab (`keyAELaunchedAsLogInItem`), for the launch status
+        /// (`launch_status`).
+        #[unsafe(method(applicationDidFinishLaunching:))]
+        fn did_finish_launching(&self, n: &NSNotification) {
+            let ev = current_apple_event();
+            let default_launch = launch_is_default(n);
+            log(&format!(
+                "launch event: {} (NSApplicationLaunchIsDefaultLaunchKey={})",
+                ev.as_ref().map(|e| e.describe()).unwrap_or_else(|| "none".into()),
+                default_launch.map(|b| b.to_string()).unwrap_or_else(|| "absent".into())
+            ));
+            LAUNCH_EVENT.with(|c| c.set(Some(ev.is_some_and(|e| e.login_item))));
+        }
+
+        #[unsafe(method(applicationSupportsSecureRestorableState:))]
+        fn secure_restorable_state(&self, _app: &NSApplication) -> bool {
+            true
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// AppleEvents.h / AERegistry.h.
+const AE_OPEN_APPLICATION: u32 = u32::from_be_bytes(*b"oapp");
+const KEY_AE_PROP_DATA: u32 = u32::from_be_bytes(*b"prdt");
+const KEY_AE_LAUNCHED_AS_LOGIN_ITEM: u32 = u32::from_be_bytes(*b"lgit");
+const KEY_AE_LAUNCHED_AS_SERVICE_ITEM: u32 = u32::from_be_bytes(*b"svit");
+
+/// The Apple event being handled (main thread), as far as the launch rules need it.
+struct AeInfo {
+    class: u32,
+    id: u32,
+    /// `keyAEPropData`'s enum code, if the event has one.
+    prop: Option<u32>,
+    /// An `oapp` event marked `keyAELaunchedAsLogInItem` or `keyAELaunchedAsServiceItem` (as its
+    /// `keyAEPropData`, or as a parameter of its own).
+    login_item: bool,
+}
+
+fn fourcc(v: u32) -> String {
+    v.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' }).collect()
+}
+
+impl AeInfo {
+    fn describe(&self) -> String {
+        format!(
+            "{}/{}{}{}",
+            fourcc(self.class),
+            fourcc(self.id),
+            self.prop.map(|p| format!(" prdt={}", fourcc(p))).unwrap_or_default(),
+            if self.login_item { " (a login item)" } else { "" }
+        )
+    }
+}
+
+/// `NSAppleEventManager.currentAppleEvent` (main thread: the event AppKit is handling).
+fn current_apple_event() -> Option<AeInfo> {
+    let ev = objc2_foundation::NSAppleEventManager::sharedAppleEventManager().currentAppleEvent()?;
+    // SAFETY: NSAppleEventDescriptor's eventClass / eventID (AEEventClass, AEEventID: FourCharCode)
+    // and paramDescriptorForKeyword: (AEKeyword -> NSAppleEventDescriptor, nullable), as in
+    // objc2-foundation's generated bindings (gated behind a feature this crate does not enable).
+    let class: u32 = unsafe { msg_send![&*ev, eventClass] };
+    let id: u32 = unsafe { msg_send![&*ev, eventID] };
+    let param = |k: u32| -> Option<Retained<objc2_foundation::NSAppleEventDescriptor>> { unsafe { msg_send![&*ev, paramDescriptorForKeyword: k] } };
+    let prop = param(KEY_AE_PROP_DATA).map(|d| d.enumCodeValue());
+    let marked = |k: u32| prop == Some(k) || param(k).is_some();
+    let login_item = id == AE_OPEN_APPLICATION && (marked(KEY_AE_LAUNCHED_AS_LOGIN_ITEM) || marked(KEY_AE_LAUNCHED_AS_SERVICE_ITEM));
+    Some(AeInfo { class, id, prop, login_item })
+}
+
+/// `NSApplicationLaunchIsDefaultLaunchKey` of the did-finish-launching notification (for the log).
+fn launch_is_default(n: &NSNotification) -> Option<bool> {
+    let info = n.userInfo()?;
+    // SAFETY: objectForKey: on an NSDictionary with an NSString key; boolValue on the NSNumber it
+    // holds for this key.
+    let v: Option<Retained<AnyObject>> = unsafe { msg_send![&*info, objectForKey: objc2_app_kit::NSApplicationLaunchIsDefaultLaunchKey] };
+    v.map(|v| unsafe { msg_send![&*v, boolValue] })
+}
+
+thread_local! {
+    /// What `applicationDidFinishLaunching` read from the launch event: whether a login item
+    /// started ZTab (`None` until then).
+    static LAUNCH_EVENT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The launch's status check (`feedback`, see `health::Feedback`), once
+/// `applicationDidFinishLaunching` has read the launch event, which may say a login item started
+/// ZTab (it waits for that up to 2 s, 100 ms at a time).
+fn launch_status(delay: Duration, feedback: health::Feedback, health_restart: bool, tries: u32) {
+    launch_step(delay, "launch status", move |st| {
+        let f = match LAUNCH_EVENT.with(|c| c.get()) {
+            None if tries < 20 => {
+                launch_status(Duration::from_millis(100), feedback, health_restart, tries + 1);
+                return;
+            }
+            None => {
+                log("launch: no launch event within 2 s; going by how ZTab was started");
+                feedback
+            }
+            Some(login_item) => health::feedback_for_launch_event(feedback, login_item, health_restart),
+        };
+        match f {
+            health::Feedback::None => log("launch: the launch event says a login item started ZTab: no status window"),
+            health::Feedback::Show => st.health_check(Trigger::Launch, false),
+            health::Feedback::IfProblems => st.health_check(Trigger::Launch, true),
+        }
+    });
+}
+
+thread_local! {
+    /// NSApplication keeps its delegate weakly.
+    static APP_DELEGATE: OnceCell<Retained<AppDelegate>> = const { OnceCell::new() };
 }
 
 /// The first-launch rule's inputs and answer for this binary (see `settings::first_launch`):
@@ -2632,6 +3218,9 @@ fn make_state(mtm: MainThreadMarker, paths: Paths, settings: Settings) -> Rc<Sta
         setup_win: RefCell::new(None),
         own_closed: Cell::new([true, true]),
         setup: RefCell::new(SetupCtl::default()),
+        health: RefCell::new(HealthCtl::default()),
+        status_shown: Cell::new(false),
+        model_started_at: Cell::new(None),
     });
     STATE.with(|s| {
         let _ = s.set(st.clone());
@@ -3247,6 +3836,20 @@ fn main() {
     if args.iter().any(|a| a == "--screen-status") {
         std::process::exit(if windows::screen_recording_granted() { 0 } else { 1 });
     }
+    // This binary as it is now (another copy, or a file replaced at this path later, differs).
+    let _ = reopen::identity();
+    // Opening ZTab while it runs (see reopen.rs): the self-test in a scratch directory (and its
+    // child), and the dry run against the running ZTab. No log, no instance lock.
+    if let Some(i) = args.iter().position(|a| a == "--reopen-selftest-server") {
+        let (Some(dir), Some(mode)) = (args.get(i + 1), args.get(i + 2)) else { std::process::exit(2) };
+        reopen::selftest_server(std::path::Path::new(dir), mode);
+    }
+    if let Some(dir) = arg_value(&args, "--reopen-selftest") {
+        std::process::exit(reopen::selftest(std::path::Path::new(&dir)));
+    }
+    if args.iter().any(|a| a == "--reopen-check") {
+        std::process::exit(reopen::reopen_check(&reopen::Ipc::user()));
+    }
 
     if let Some(i) = args.iter().position(|a| a == "--dump-windows") {
         dump_windows(args.get(i + 1).map(String::as_str).unwrap_or("/dev/stdout"));
@@ -3306,11 +3909,37 @@ fn main() {
     }
 
     let diag = ["--snapshot", "--dump-model", "--panel-bench", "--label-check"].iter().any(|f| args.iter().any(|a| a == f));
-    // One ZTab at a time, whatever settings it uses (the diagnostics modes run beside it).
-    if !diag && !settings::take_instance_lock() {
-        log(&format!("another ZTab instance is running; exiting (pid {})", std::process::id()));
-        log_flush(Duration::from_millis(300));
-        return;
+    // One ZTab at a time, whatever settings it uses (the diagnostics modes run beside it). A ZTab
+    // opened by hand while another runs asks it to check itself and show its status, or replaces
+    // it (another binary, or one that does not answer); right after login it asks quietly; one
+    // started by launchd or a script just exits (see reopen.rs).
+    let launch_kind = reopen::launch_kind(std::env::var("XPC_SERVICE_NAME").ok().as_deref(), &args, reopen::secs_since_login());
+    let mut launch_notes: Vec<String> = Vec::new();
+    if !diag {
+        let ipc = reopen::Ipc::user();
+        let mut held = reopen::take_lock(&ipc);
+        if held && reopen::someone_listens(&ipc) {
+            // A ZTab whose lock file was removed (the temporary directory is cleaned up) still runs.
+            log(&format!(
+                "reopen: the instance lock was free, but a ZTab listens on {} (its lock file was removed?): it is the running one",
+                ipc.socket.display()
+            ));
+            reopen::release_lock();
+            held = false;
+        }
+        if !held {
+            let dry_run = reopen::dry_run(&args, std::env::var("ZTAB_TAKEOVER").ok().as_deref());
+            match reopen::second_instance(&ipc, launch_kind, dry_run, log) {
+                reopen::Second::Exit => {
+                    log_flush(Duration::from_millis(300));
+                    return;
+                }
+                reopen::Second::Continue(note) => launch_notes.push(note),
+            }
+        }
+        if let Err(e) = reopen::serve(&ipc, Arc::new(on_reopen_request), log, quit_for_holder) {
+            log(&format!("reopen: not listening ({e}): a second ZTab opened by hand cannot ask this one"));
+        }
     }
 
     // A tiny file: read here (well under a millisecond) so the tap starts with the right shortcuts.
@@ -3338,6 +3967,16 @@ fn main() {
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    // ZTab's login agent starts it at login (when the user wants that): never macOS's own relaunch
+    // of the apps that ran at logout, which would start it when start at login is off and show
+    // up as an argument-free launch right after login (Apple's recommended use for apps that
+    // launchd starts: once, never paired with enableRelaunchOnLogin).
+    app.disableRelaunchOnLogin();
+    // Opening this copy again while it runs (the reopen event): the health check.
+    APP_DELEGATE.with(|d| {
+        let d = d.get_or_init(|| AppDelegate::new(mtm));
+        app.setDelegate(Some(ProtocolObject::from_ref(&**d)));
+    });
     timeline.mark("nsapp");
 
     let st = make_state(mtm, paths, loaded);
@@ -3418,6 +4057,43 @@ fn main() {
         log(&format!("setup: the Set up window opens at launch: {why}"));
         launch_step(Duration::from_millis(150), "setup window", move |st| st.show_setup(why));
     }
+    // Opened by hand (or restarted by a health check): check and show the status once ZTab is up;
+    // right after login without arguments: checked, shown only when something is wrong or was
+    // fixed; started by a login item (its launch event says so): nothing (see `launch_status`).
+    let health_restart = health::take_marker(&health::marker_path(), now_secs());
+    if let Some(r) = &health_restart {
+        log(&format!("health: started by a health restart ({r})"));
+        launch_notes.push(format!("ZTab restarted itself ({r})"));
+        if setup::is_wedge_reason(r) {
+            // Not again for a while (see `arm_wedge_watchdog`).
+            WEDGE_RESTARTED_AT_MS.store(now_ms(), Ordering::SeqCst);
+        }
+    }
+    {
+        let mut h = st.health.borrow_mut();
+        h.restarted_for = health_restart.clone();
+        h.launch_notes = launch_notes;
+        h.inject_tap = arg_value(&args, "--inject-health").as_deref() == Some("tap");
+    }
+    let feedback = health::launch_feedback(launch_kind, setup_reason.is_some(), health_restart.is_some());
+    if diag {
+        // Never (the diagnostics modes returned above).
+    } else if feedback != health::Feedback::None {
+        log(&format!(
+            "launch: {launch_kind:?}: {} once ZTab is up (unless its launch event says a login item started it)",
+            if feedback == health::Feedback::Show {
+                "the status is shown"
+            } else {
+                "checked quietly (a window only if something is wrong or was fixed: maybe a login item)"
+            }
+        ));
+        launch_status(Duration::from_millis(500), feedback, health_restart.is_some(), 0);
+    } else {
+        log(&format!(
+            "launch: {launch_kind:?}: no status window{}",
+            if setup_reason.is_some() { " (the Set up window opens)" } else { "" }
+        ));
+    }
     st.install_workspace_observers();
     // No-ops when they were started above (Accessibility granted).
     st.try_install_hotkey();
@@ -3450,6 +4126,13 @@ fn main() {
     // (`stall_log`).
     LAUNCH_UNTIL_MS.store(now_ms() + 1000, Ordering::SeqCst);
     start_stall_detector(&st, probe_period, stall_summary, stall_threshold);
+    // A main thread stuck in one unit of work: restart from the watcher's thread (0: never).
+    let wedge_s = arg_value(&args, "--wedge-restart-s").and_then(|v| v.parse::<f64>().ok()).unwrap_or(WEDGE_RESTART_S);
+    if wedge_s > 0.0 {
+        st.arm_wedge_watchdog(Duration::from_secs_f64(wedge_s));
+    } else {
+        log("wedge watchdog: off (--wedge-restart-s 0)");
+    }
     // Verification aid: block the main thread once, so the stall detectors can be checked in the
     // real app (`--inject-stall-ms 150` must log one stall of about 150 ms), `--inject-stall-at-s`
     // (default 3) after launch.

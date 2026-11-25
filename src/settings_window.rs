@@ -30,7 +30,7 @@ use crate::settings::{MAX_SHOW_DELAY_MS, Settings};
 pub const WINDOW_TITLE: &str = "ZTab Settings";
 const RECORDING_TITLE: &str = "Type shortcut…";
 const W: f64 = 500.0;
-const H: f64 = 360.0;
+const H: f64 = 388.0;
 
 /// What the user did in the window.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -424,14 +424,15 @@ impl SettingsWindow {
 
         let message = label(mtm, "", 12.0, false);
         set_id(&message, "ztab.message");
-        add(&message, x0, 262.0, W - 2.0 * x0, 36.0);
+        // Up to four lines: the health status of a launch by hand says what it fixed.
+        add(&message, x0, 262.0, W - 2.0 * x0, 64.0);
 
         // SAFETY: as above.
         let restore = unsafe {
             NSButton::buttonWithTitle_target_action(&NSString::from_str("Restore defaults"), Some(target_obj), Some(sel!(restoreDefaults:)), mtm)
         };
         set_id(&restore, "ztab.restore");
-        add(&restore, x0 - 6.0, 310.0, 160.0, 30.0);
+        add(&restore, x0 - 6.0, 338.0, 160.0, 30.0);
 
         SettingsWindow {
             window,

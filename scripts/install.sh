@@ -84,11 +84,11 @@ fi
 if [ "$LOGIN" = 1 ] || [ -f "$AGENT" ]; then
   if ! env -u ZTAB_SETTINGS_DIR "$DEST/Contents/MacOS/ztab" --set-login on; then
     echo "install.sh: the login item was not loaded; starting ZTab directly" >&2
-    open -g "$DEST"
+    open -g "$DEST" --args --background
   fi
 else
   # Recorded in the settings (login_item_offered), so ZTab's first launch leaves it off.
   env -u ZTAB_SETTINGS_DIR "$DEST/Contents/MacOS/ztab" --set-login off >/dev/null || true
-  open -g "$DEST"
+  open -g "$DEST" --args --background
 fi
 echo "installed $DEST"

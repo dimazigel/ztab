@@ -831,23 +831,9 @@ impl Writer {
 // Single instance
 // ---------------------------------------------------------------------------------------------
 
-/// Take the per-user single-instance lock (an exclusive `flock` on a file in the user's temporary
-/// directory, held until the process exits). `false`: another ZTab holds it. Independent of the
-/// settings location: two ZTabs must never run at once, whatever settings they use.
-pub fn take_instance_lock() -> bool {
-    let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path()) else {
-        // No lock file possible: do not refuse to start over it.
-        return true;
-    };
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: plain syscall on a valid descriptor.
-    let ok = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if ok {
-        // Held for the life of the process.
-        std::mem::forget(f);
-    }
-    ok
-}
+// The lock itself (an exclusive `flock` on this file, held until the process exits, independent
+// of the settings location: two ZTabs must never run at once, whatever settings they use) is taken
+// and checked in `reopen.rs`, next to the socket a second ZTab asks the running one through.
 
 /// The single-instance lock file (it stays after ZTab exits).
 pub fn lock_path() -> PathBuf {
