@@ -1,6 +1,6 @@
 #!/bin/bash
-# Runs after ZTab.app is installed, in one of two places (Installer's "Install for all users" or
-# "Install for me only"; $2 is the target: "/" or the user's home folder):
+# Runs after ZTab.app is installed. The package installs for all users only ($2 = "/"; the
+# per-user branch below is kept for a target other than "/", which distribution.xml no longer offers):
 #  - for all users: /Applications/ZTab.app. Runs as root and acts for the user logged in at the
 #    screen (the console user), as that user (launchctl asuser + sudo -u, with their HOME):
 #     1. an old copy in ~/Applications (bundle id dev.ztab.app) and its receipt in the home folder

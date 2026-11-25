@@ -45,29 +45,6 @@ It switches between *windows*, not apps.
   **Quit ZTab**.
   While **secure input** is on, the icon gets a lock and the menu says that macOS is pausing ⌥Tab.
 
-## Install with Homebrew
-
-```sh
-brew install dimazigel/tap/ztab
-open "$(brew --prefix)/opt/ztab/ZTab.app"   # once: ZTab starts now, and from then on at every login
-```
-
-Homebrew cannot turn on a login item while it installs, so ZTab does it itself on its first launch
-(see [Start at login on the first launch](#start-at-login-on-the-first-launch)): open it once as
-above. If ZTab ran for you before (an earlier install, a copy opened from a disk image), the first
-launch leaves the login item as it is; turn it on with *Start ZTab at login* in Settings, or with
-`ztab --set-login on` (which also starts ZTab now). Untick the box to stop it starting at login.
-Running the same `open` again later is always safe: ZTab checks itself and shows the result, and
-after `brew upgrade` it replaces the running old version (see [Opening ZTab](#opening-ztab)).
-
-Homebrew builds ZTab from source on your Mac (it needs Rust, which it installs for the build), so
-macOS shows no "cannot verify the developer" warning. The app is in
-`$(brew --prefix)/opt/ztab/ZTab.app`; to see it in Launchpad and Spotlight, link it into
-Applications: `ln -sf "$(brew --prefix)/opt/ztab/ZTab.app" ~/Applications/`. The login item
-points at Homebrew's stable `opt` path, so it survives `brew upgrade`. A Homebrew build is signed
-ad hoc (no developer identity), so macOS asks for the Accessibility and Screen Recording
-permissions again after each upgrade. Use either Homebrew or the installer package, not both.
-
 ## Build and install
 
 You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
@@ -75,8 +52,6 @@ You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
 ```sh
 scripts/install.sh           # build, copy to /Applications/ZTab.app, start it now and at login (`ztab --set-login on`, see below)
 scripts/install.sh --no-login  # same, but only launch it (a login item that was on stays on, pointed at the new copy; off stays off: `ztab --set-login off` records that, so the first launch does not turn it on)
-scripts/install.sh --user    # install into ~/Applications for you only (no administrator)
-scripts/uninstall.sh --user  # remove only your own ~/Applications copy and login item (no sudo)
 scripts/uninstall.sh         # stop it, remove your login item, the app and the receipts (settings are kept)
 scripts/bundle.sh            # just build dist/ZTab.app
 scripts/make-icon.sh         # regenerate packaging/AppIcon.icns from scripts/make-icon.swift
@@ -85,28 +60,17 @@ scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.p
 
 ### Installer package
 
-`scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). Installer
-offers two places (*Change Install Location…* on the Installation Type step):
-
-- **Install for all users of this computer**: `/Applications/ZTab.app`; asks for an
-  administrator's password.
-- **Install for me only**: `~/Applications/ZTab.app`; no password, so anyone can install it.
-
-Double-click it, or from a terminal:
+`scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). It installs
+`ZTab.app` into `/Applications`, for every user of the Mac, so the installer asks for an
+administrator's password. Double-click it, or from a terminal:
 
 ```sh
-sudo installer -pkg dist/ZTab-<version>.pkg -target /                          # all users
-installer -pkg dist/ZTab-<version>.pkg -target CurrentUserHomeDirectory        # me only
+sudo installer -pkg dist/ZTab-<version>.pkg -target /
 ```
 
-**For me only**, the scripts run as you: they quit your ZTab, turn on your login item for
-`~/Applications/ZTab.app` (kept off on an upgrade where you had turned it off, as below) and start
-ZTab. A copy installed for all users in `/Applications` is left in place (removing it needs an
-administrator); your login item starts your own copy, and only one ZTab runs at a time.
-
-**For all users**: its scripts run as root and act for the user logged in at the screen, as that user: before the
+Its scripts run as root and act for the user logged in at the screen, as that user: before the
 copy they quit that user's ZTab; afterwards they remove an old `~/Applications/ZTab.app` of theirs
-(a "me only" install or one from 0.1.0, bundle id `dev.ztab.app`) and its receipt in the home folder, so
+(from 0.1.0 or 0.2.1–0.2.4, bundle id `dev.ztab.app`) and its receipt in the home folder, so
 there is exactly one ZTab, turn on their login item (`ztab --set-login on`, pointing at
 `/Applications/ZTab.app`) and start ZTab. On an upgrade where they had turned *Start ZTab at login*
 off, it stays off (ZTab is just started). An upgrade means: ZTab was installed, this user has used
@@ -117,11 +81,11 @@ The login item is per user. Other users of the Mac open ZTab from Applications o
 launch for them turns their login item on (see [Start at login on the first
 launch](#start-at-login-on-the-first-launch); if they used ZTab before, they tick *Start ZTab at
 login* in its Settings instead). For the user at the screen,
-an install for all users replaces their own per-user `~/Applications/ZTab.app` (a "me only"
-install, or one from 0.1.0). Another user who has their own per-user copy keeps running it: their
+the install replaces their own per-user `~/Applications/ZTab.app` (from 0.1.0 or 0.2.1–0.2.4).
+Another user who has their own per-user copy keeps running it: their
 login item starts it, and while it runs, opening the shared one does nothing (one ZTab per user).
-To switch to the shared copy they quit ZTab (its menu → Quit), run `scripts/uninstall.sh --user`
-(or delete `~/Applications/ZTab.app`), open ZTab from Applications and tick *Start ZTab at login*
+To switch to the shared copy they quit ZTab (its menu → Quit), delete
+`~/Applications/ZTab.app`, open ZTab from Applications and tick *Start ZTab at login*
 in its Settings. The installer lists these copies in
 `/var/log/install.log`. When nobody is logged in at the screen (for example `sudo installer` over
 ssh), only the app is installed; the per-user steps are skipped and `/var/log/install.log` says why
@@ -131,9 +95,7 @@ ssh), only the app is installed; the per-user steps are skipped and `/var/log/in
 there), with the same migration of `~/Applications/ZTab.app`. It refuses, before stopping
 anything, when `/Applications/ZTab.app` was installed by the package (it then belongs to root: use
 the package, or `sudo rm -rf /Applications/ZTab.app` first), or when the user cannot write to
-`/Applications` (not an administrator: use `--user` or the package). `scripts/install.sh --user`
-installs into `~/Applications` for you only, without an administrator, like the package's
-*Install for me only*.
+`/Applications` (not an administrator: use the package).
 
 The package is not notarized, so a copy downloaded from the internet is blocked on first open:
 allow it under *System Settings → Privacy & Security → Open Anyway*. (Avoiding that needs a paid
@@ -224,7 +186,7 @@ confusing.
 ## Opening ZTab
 
 Opening ZTab by hand (double-clicking it in Finder, from Spotlight or Launchpad, or
-`open /Applications/ZTab.app`, `open "$(brew --prefix)/opt/ztab/ZTab.app"`) always ends with one
+`open /Applications/ZTab.app`) always ends with one
 ZTab running for you and something to see:
 
 - **It was not running**: ZTab starts. When a permission is missing, the **Set up ZTab** window
@@ -234,7 +196,7 @@ ZTab running for you and something to see:
   the reopen to the running ZTab (the same copy) or starts a second process (another copy, or
   `open -n`); that process asks the running ZTab and exits.
 - **Another binary runs**: another copy, another version, or the app was replaced since it
-  started (an upgrade by `brew upgrade`, the installer package or `install.sh`). When a second
+  started (an upgrade by the installer package or `install.sh`). When a second
   process asks, the running ZTab quits and the one just opened takes over and shows its status
   (*Fixed: replaced ZTab 0.2.4 (…) that was running.*). When macOS hands the reopen to the running
   ZTab instead, its health check finds another binary at the path it was opened by and restarts
@@ -276,7 +238,7 @@ in the log (`health …` lines):
 | Checked | When it is not right |
 |---|---|
 | Accessibility, Screen Recording | The Set up window opens instead of Settings (for Screen Recording only unless you chose *Skip Thumbnails*; then the status says thumbnails are off). Screen Recording granted since ZTab started: ZTab restarts so that thumbnails work, as the Set up window does. |
-| The binary | Another binary is installed at the path ZTab was opened by (an upgrade in place, or Homebrew's `opt` link now pointing at a newer keg): ZTab restarts into it (through that path, or its login agent), once; everything else is then checked by the new one. |
+| The binary | Another binary is installed at the path ZTab was opened by (an upgrade in place): ZTab restarts into it (through that path, or its login agent), once; everything else is then checked by the new one. |
 | ⌥Tab's keyboard hook (the event tap): installed, enabled, its thread answering | Switched off by macOS: switched on again (*Fixed: …*). Not installed although Accessibility is granted, not answering within 0.5 s, or staying off: ZTab restarts itself once; the restarted ZTab shows its status saying why. If the restart did not help, the status says so (in orange) and ZTab does not restart again (after any restart by the health check, it never makes another). |
 | The window list | Not running although Accessibility is granted: started. Still not complete after 30 s: mentioned. |
 | The main thread | A stall of 2 s or more since launch is mentioned (the log has its details). Stuck in one piece of work for 15 s, and still a second later: ZTab restarts itself from the stall watcher's thread (it does not need the stuck one), and the restarted ZTab shows its status (*Fixed: ZTab restarted itself (its main thread was stuck for 15 s).*). It does not do that again within 10 minutes of such a restart. |
@@ -388,7 +350,7 @@ send the real login item into a test directory.
 ### Start at login on the first launch
 
 ZTab turns its login item on by itself **once**: on the very first launch of an installed copy for
-this user. So a Homebrew install (which cannot do it while installing) only has to open the app
+this user, so a copy dragged into Applications by hand also starts at login after it is opened
 once. The rule, at every launch (`settings::first_launch`):
 
 1. **Settled**: the settings say `login_item_offered = true`: nothing happens. Outcomes 3 and 4
@@ -411,8 +373,7 @@ once. The rule, at every launch (`settings::first_launch`):
    deleted all of these (the log, the settings folder and the lock file). After a first launch
    that could not write the agent (`login_item_retry = true`, see 4) only a file at the agent's
    path counts: the other traces are that launch's own.
-4. **Otherwise** it is the first launch: ZTab writes the login agent for this binary (a Homebrew
-   keg by its stable `opt` path, as the checkbox does) and records it. If the agent cannot be
+4. **Otherwise** it is the first launch: ZTab writes the login agent for this binary and records it. If the agent cannot be
    written (for example `~/Library/LaunchAgents` is not writable, or the disk is full), start at
    login stays off, the question stays open (`login_item_retry = true` instead of the record),
    and every later launch tries again until it works or the box is ticked or unticked.
