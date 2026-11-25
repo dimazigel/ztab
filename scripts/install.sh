@@ -1,10 +1,15 @@
 #!/bin/bash
 # Build ZTab.app, install it to /Applications (for every user of this Mac) and start it at login,
 # like the installer package. An administrator can write to /Applications without sudo; anyone else
-# gets a clear error (use the package: it asks for an administrator's password).
-# Usage: scripts/install.sh [--no-login]   (--login, the default, is still accepted)
+# gets a clear error (use --user, or the package).
+# Usage: scripts/install.sh [--user] [--no-login]   (--login, the default, is still accepted)
 #
-# Migration: a copy installed by an earlier version in ~/Applications (bundle id dev.ztab.app) is
+# --user: install into ~/Applications for this user only (no administrator needed), like the
+# package's "Install for me only". A shared /Applications/ZTab.app is left alone (removing it needs
+# an administrator); this user's login item then starts the per-user copy.
+#
+# Migration (without --user): your own per-user copy in ~/Applications (bundle id dev.ztab.app; a
+# "me only" install or one from 0.1.0) is
 # removed, with its package receipt in the home folder, so there is exactly one ZTab.
 #
 # Login item: ZTab owns it, per user. `ztab --set-login on` writes
@@ -23,21 +28,33 @@ DEST="/Applications/ZTab.app"
 OLD="$HOME/Applications/ZTab.app"
 AGENT="$HOME/Library/LaunchAgents/dev.ztab.app.plist"
 LOGIN=1
-case "${1:-}" in
-  --no-login) LOGIN=0 ;;
-  --login | "") ;;
-  *) echo "usage: scripts/install.sh [--no-login]" >&2; exit 2 ;;
-esac
+USER_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --no-login) LOGIN=0 ;;
+    --login) ;;
+    --user) USER_ONLY=1 ;;
+    *) echo "usage: scripts/install.sh [--user] [--no-login]" >&2; exit 2 ;;
+  esac
+done
+if [ "$USER_ONLY" = 1 ]; then
+  DEST="$HOME/Applications/ZTab.app"
+  mkdir -p "$HOME/Applications"
+fi
 
 # Before anything is stopped: can this user replace /Applications/ZTab.app?
-if [ ! -w /Applications ]; then
+if [ "$USER_ONLY" = 1 ]; then
+  if [ -e "$DEST" ] && [ -n "$(find "$DEST" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
+    echo "install.sh: $DEST does not belong to $(id -un); remove it first." >&2
+    exit 1
+  fi
+elif [ ! -w /Applications ]; then
   echo "install.sh: $(id -un) cannot write to /Applications (not an administrator)." >&2
-  echo "  Build the installer package (scripts/make-pkg.sh) and open it: it asks for an administrator's password." >&2
+  echo "  Install for yourself only with: scripts/install.sh --user" >&2
   exit 1
-fi
-if [ -e "$DEST" ] && [ -n "$(find "$DEST" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
+elif [ -e "$DEST" ] && [ -n "$(find "$DEST" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
   echo "install.sh: $DEST was installed by the package (it belongs to $(stat -f %Su "$DEST"))." >&2
-  echo "  Install the new version with the package, or remove that copy first:" >&2
+  echo "  Install the new version with the package, install for yourself only (--user), or remove that copy first:" >&2
   echo "  sudo rm -rf $DEST && sudo pkgutil --forget dev.ztab.app.pkg" >&2
   exit 1
 fi
@@ -48,14 +65,18 @@ for _ in $(seq 1 50); do pgrep -x ztab >/dev/null || break; sleep 0.1; done
 rm -rf "$DEST"
 cp -R dist/ZTab.app "$DEST"
 
-# The per-user copy of earlier versions (never the copy just installed, should ~/Applications
-# lead to /Applications).
-if [ -d "$OLD" ] && ! [ "$OLD" -ef "$DEST" ] \
+# Your own per-user copy (never the copy just installed, should ~/Applications
+# lead to /Applications). With --user it is the copy just installed; a shared one is only noted.
+if [ "$USER_ONLY" = 1 ]; then
+  if [ -d /Applications/ZTab.app ] && ! [ /Applications/ZTab.app -ef "$DEST" ]; then
+    echo "note: ZTab is also installed for all users in /Applications; your login item starts $DEST"
+  fi
+elif [ -d "$OLD" ] && ! [ "$OLD" -ef "$DEST" ] \
   && [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$OLD/Contents/Info.plist" 2>/dev/null)" = dev.ztab.app ]; then
   rm -rf "$OLD"
   echo "removed the old copy $OLD"
 fi
-if pkgutil --volume "$HOME" --pkgs 2>/dev/null | grep -qx dev.ztab.app.pkg; then
+if [ "$USER_ONLY" = 0 ] && pkgutil --volume "$HOME" --pkgs 2>/dev/null | grep -qx dev.ztab.app.pkg; then
   pkgutil --volume "$HOME" --forget dev.ztab.app.pkg >/dev/null && echo "forgot the old package receipt in $HOME"
 fi
 

@@ -1,14 +1,17 @@
 #!/bin/bash
 # Build an installer package: dist/ZTab-<version>.pkg.
-# It installs ZTab.app into /Applications for every user of the Mac, so Installer asks for an
-# administrator's password. Its scripts run as root and act for the user logged in at the screen:
+# Installer offers two places: "Install for all users of this computer" (/Applications; asks for
+# an administrator's password) or "Install for me only" (~/Applications; no password). For all
+# users, its scripts run as root and act for the user logged in at the screen:
 # preinstall quits their ZTab; postinstall removes an old ~/Applications/ZTab.app of theirs (and its
 # receipt), turns on their login item (kept off on an upgrade if they had turned it off) and starts
-# ZTab. With nobody at the screen (an install over ssh) only the app is installed. Apple silicon,
+# ZTab. With nobody at the screen (an install over ssh) only the app is installed. For me only, the
+# scripts run as that user: login item and start, for the per-user copy. Apple silicon,
 # macOS 14+. The app is signed like scripts/bundle.sh signs it; ZTAB_PKG_SIGN_IDENTITY signs the
 # package itself. Neither removes the Gatekeeper prompt for a downloaded copy: that needs Developer
 # ID signing plus notarization.
-# Install from the command line: sudo installer -pkg dist/ZTab-<version>.pkg -target /
+# Install from the command line: sudo installer -pkg dist/ZTab-<version>.pkg -target /   (all users)
+#                            or: installer -pkg dist/ZTab-<version>.pkg -target CurrentUserHomeDirectory   (me only)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -36,4 +39,6 @@ SIGN=()
 [ -n "${ZTAB_PKG_SIGN_IDENTITY:-}" ] && SIGN=(--sign "$ZTAB_PKG_SIGN_IDENTITY")
 productbuild --distribution "$WORK/distribution.xml" --resources packaging/pkg/resources \
   --package-path "$WORK" ${SIGN[@]+"${SIGN[@]}"} "$OUT" >/dev/null
-echo "built $OUT ($(du -h "$OUT" | cut -f1)); install: sudo installer -pkg $OUT -target /"
+echo "built $OUT ($(du -h "$OUT" | cut -f1))"
+echo "  all users: sudo installer -pkg $OUT -target /"
+echo "  me only:   installer -pkg $OUT -target CurrentUserHomeDirectory"

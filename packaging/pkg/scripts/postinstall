@@ -1,17 +1,31 @@
 #!/bin/bash
-# Runs as root after /Applications/ZTab.app is installed, for the user logged in at the screen
-# (the console user), as that user (launchctl asuser + sudo -u, with their HOME):
-#  1. an old copy in ~/Applications (bundle id dev.ztab.app) and its receipt in the home folder are
-#     removed, so there is exactly one ZTab;
-#  2. their login item is turned on (`ztab --set-login on` writes
-#     ~/Library/LaunchAgents/dev.ztab.app.plist for /Applications/ZTab.app and loads it, which starts
-#     ZTab now), unless this is an upgrade on which they had turned it off (preinstall's note);
-#  3. if ZTab is not running a few seconds later (launchd refused the job, or the login item stays
-#     off), it is started directly.
-# Other users turn on "Start ZTab at login" in ZTab's Settings; an old per-user copy of theirs is
-# theirs to remove (it is reported here, see the README). With nobody at the screen (an install
-# over ssh) only the app is installed. Lines printed here go to /var/log/install.log.
-APP="/Applications/ZTab.app"
+# Runs after ZTab.app is installed, in one of two places (Installer's "Install for all users" or
+# "Install for me only"; $2 is the target: "/" or the user's home folder):
+#  - for all users: /Applications/ZTab.app. Runs as root and acts for the user logged in at the
+#    screen (the console user), as that user (launchctl asuser + sudo -u, with their HOME):
+#     1. an old copy in ~/Applications (bundle id dev.ztab.app) and its receipt in the home folder
+#        are removed, so there is exactly one ZTab;
+#     2. their login item is turned on (`ztab --set-login on` writes
+#        ~/Library/LaunchAgents/dev.ztab.app.plist for the installed binary and loads it, which
+#        starts ZTab now), unless this is an upgrade on which they had turned it off (preinstall's
+#        note);
+#     3. if ZTab is not running a few seconds later (launchd refused the job, or the login item
+#        stays off), it is started directly.
+#    Other users turn on "Start ZTab at login" in ZTab's Settings; an old per-user copy of theirs
+#    is theirs to remove (it is reported here, see the README). With nobody at the screen (an
+#    install over ssh) only the app is installed.
+#  - for me only: ~/Applications/ZTab.app, no administrator password; runs as that user. Steps 2
+#    and 3 as above, for the per-user copy. A shared /Applications/ZTab.app is left alone (only an
+#    administrator can remove it); this user's login item starts the per-user copy.
+# Lines printed here go to /var/log/install.log.
+TARGET="${2:-/}"
+if [ "$TARGET" = "/" ]; then
+  MODE=system
+  APP="/Applications/ZTab.app"
+else
+  MODE=user
+  APP="${TARGET%/}/Applications/ZTab.app"
+fi
 BIN="$APP/Contents/MacOS/ztab"
 [ -x "$BIN" ] || { echo "ZTab postinstall: $BIN not found" >&2; exit 0; }
 if [ "$(id -u)" = 0 ]; then
@@ -53,26 +67,29 @@ if [ -n "$TMP_" ]; then
   fi
 fi
 
-# 1. The per-user copy of earlier versions (never the copy just installed, should
-#    ~/Applications lead to /Applications).
+# 1. For all users: this user's own per-user copy (a "me only" install, or one from 0.1.0; never the copy just installed, should
+#    ~/Applications lead to /Applications). For me only: a shared copy is only reported.
 OLD="$USER_HOME/Applications/ZTab.app"
-if [ -d "$OLD" ] && ! [ "$OLD" -ef "$APP" ] \
+if [ "$MODE" = user ]; then
+  if [ -d /Applications/ZTab.app ] && ! [ /Applications/ZTab.app -ef "$APP" ]; then
+    echo "ZTab postinstall: ZTab is also installed for all users in /Applications; $USER_NAME's login item starts $APP"
+  fi
+elif [ -d "$OLD" ] && ! [ "$OLD" -ef "$APP" ] \
   && [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$OLD/Contents/Info.plist" 2>/dev/null)" = dev.ztab.app ]; then
   pkill -u "$UID_" -f "^$OLD/Contents/MacOS/ztab" 2>/dev/null
   as_user /bin/rm -rf "$OLD" && echo "ZTab postinstall: removed the old copy $OLD"
 fi
-if as_user /usr/sbin/pkgutil --volume "$USER_HOME" --pkgs 2>/dev/null | grep -qx dev.ztab.app.pkg; then
+if [ "$MODE" = system ] && as_user /usr/sbin/pkgutil --volume "$USER_HOME" --pkgs 2>/dev/null | grep -qx dev.ztab.app.pkg; then
   as_user /usr/sbin/pkgutil --volume "$USER_HOME" --forget dev.ztab.app.pkg >/dev/null \
     && echo "ZTab postinstall: forgot the old package receipt in $USER_HOME"
 fi
-# Other users' per-user copies of earlier versions: theirs to remove (their login item keeps
-# starting that copy, and opening the new one does nothing while it runs).
-for h in /Users/*; do
+# Other users' own per-user copies stay theirs (their login item keeps starting that copy).
+[ "$MODE" = system ] && for h in /Users/*; do
   [ "$h" = "$USER_HOME" ] && continue
   o="$h/Applications/ZTab.app"
   if [ -d "$o" ] && ! [ "$o" -ef "$APP" ]; then
-    echo "ZTab postinstall: $(basename "$h") still has an earlier per-user copy, $o: they should quit ZTab," \
-      "delete that copy and open ZTab from Applications (see the README)"
+    echo "ZTab postinstall: $(basename "$h") has their own per-user copy, $o, which their login item starts;" \
+      "to use the shared copy they delete it and turn on Start at login in ZTab's Settings (see the README)"
   fi
 done
 

@@ -49,6 +49,8 @@ You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
 ```sh
 scripts/install.sh           # build, copy to /Applications/ZTab.app, start it now and at login (`ztab --set-login on`, see below)
 scripts/install.sh --no-login  # same, but only launch it (a login item that was on stays on, pointed at the new copy)
+scripts/install.sh --user    # install into ~/Applications for you only (no administrator)
+scripts/uninstall.sh --user  # remove only your own ~/Applications copy and login item (no sudo)
 scripts/uninstall.sh         # stop it, remove your login item, the app and the receipts (settings are kept)
 scripts/bundle.sh            # just build dist/ZTab.app
 scripts/make-icon.sh         # regenerate packaging/AppIcon.icns from scripts/make-icon.swift
@@ -57,17 +59,28 @@ scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.p
 
 ### Installer package
 
-`scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). It installs
-`ZTab.app` into `/Applications`, for every user of the Mac, so the installer asks for an
-administrator's password. Double-click it, or from a terminal:
+`scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). Installer
+offers two places (*Change Install Location…* on the Installation Type step):
+
+- **Install for all users of this computer**: `/Applications/ZTab.app`; asks for an
+  administrator's password.
+- **Install for me only**: `~/Applications/ZTab.app`; no password, so anyone can install it.
+
+Double-click it, or from a terminal:
 
 ```sh
-sudo installer -pkg dist/ZTab-<version>.pkg -target /
+sudo installer -pkg dist/ZTab-<version>.pkg -target /                          # all users
+installer -pkg dist/ZTab-<version>.pkg -target CurrentUserHomeDirectory        # me only
 ```
 
-Its scripts run as root and act for the user logged in at the screen, as that user: before the
+**For me only**, the scripts run as you: they quit your ZTab, turn on your login item for
+`~/Applications/ZTab.app` (kept off on an upgrade where you had turned it off, as below) and start
+ZTab. A copy installed for all users in `/Applications` is left in place (removing it needs an
+administrator); your login item starts your own copy, and only one ZTab runs at a time.
+
+**For all users**: its scripts run as root and act for the user logged in at the screen, as that user: before the
 copy they quit that user's ZTab; afterwards they remove an old `~/Applications/ZTab.app` of theirs
-(installed by an earlier version, bundle id `dev.ztab.app`) and its receipt in the home folder, so
+(a "me only" install or one from 0.1.0, bundle id `dev.ztab.app`) and its receipt in the home folder, so
 there is exactly one ZTab, turn on their login item (`ztab --set-login on`, pointing at
 `/Applications/ZTab.app`) and start ZTab. On an upgrade where they had turned *Start ZTab at login*
 off, it stays off (ZTab is just started). An upgrade means: ZTab was installed, this user has used
@@ -75,11 +88,13 @@ it (an old per-user copy, its log or its settings folder) and has no login item;
 install of the shared app does not count, so a user's first install always turns it on.
 
 The login item is per user. Other users of the Mac open ZTab from Applications and tick *Start
-ZTab at login* in its Settings; opening ZTab alone runs it only until they log out. A user who
-still has a per-user `~/Applications/ZTab.app` from an earlier version keeps running that copy:
-their login item starts it, and while it runs, opening the new one does nothing (one ZTab per
-user). They quit ZTab (its menu → Quit), delete `~/Applications/ZTab.app`, open ZTab from
-Applications and tick *Start ZTab at login* in its Settings. The installer lists these copies in
+ZTab at login* in its Settings; opening ZTab alone runs it only until they log out. For the user at the screen,
+an install for all users replaces their own per-user `~/Applications/ZTab.app` (a "me only"
+install, or one from 0.1.0). Another user who has their own per-user copy keeps running it: their
+login item starts it, and while it runs, opening the shared one does nothing (one ZTab per user).
+To switch to the shared copy they quit ZTab (its menu → Quit), run `scripts/uninstall.sh --user`
+(or delete `~/Applications/ZTab.app`), open ZTab from Applications and tick *Start ZTab at login*
+in its Settings. The installer lists these copies in
 `/var/log/install.log`. When nobody is logged in at the screen (for example `sudo installer` over
 ssh), only the app is installed; the per-user steps are skipped and `/var/log/install.log` says why
 (an old `~/Applications/ZTab.app` is then left in place: the same steps apply).
@@ -88,7 +103,9 @@ ssh), only the app is installed; the per-user steps are skipped and `/var/log/in
 there), with the same migration of `~/Applications/ZTab.app`. It refuses, before stopping
 anything, when `/Applications/ZTab.app` was installed by the package (it then belongs to root: use
 the package, or `sudo rm -rf /Applications/ZTab.app` first), or when the user cannot write to
-`/Applications` (not an administrator: use the package).
+`/Applications` (not an administrator: use `--user` or the package). `scripts/install.sh --user`
+installs into `~/Applications` for you only, without an administrator, like the package's
+*Install for me only*.
 
 The package is not notarized, so a copy downloaded from the internet is blocked on first open:
 allow it under *System Settings → Privacy & Security → Open Anyway*. (Avoiding that needs a paid

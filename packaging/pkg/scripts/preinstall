@@ -1,6 +1,7 @@
 #!/bin/bash
-# Runs as root before /Applications/ZTab.app is replaced, for the user logged in at the screen (the
-# console user): remember whether they had turned the login item off, then quit their ZTab
+# Runs before ZTab.app is replaced: as root for an install for all users (/Applications, $2 = "/"),
+# for the user logged in at the screen (the console user); as the user for an install for them only
+# (~/Applications, $2 = their home folder). For that user: remember whether they had turned the login item off, then quit their ZTab
 # (postinstall starts it again). With nobody at the screen (an install over ssh) there is nothing
 # to do. Lines printed here go to /var/log/install.log.
 if [ "$(id -u)" = 0 ]; then
@@ -36,7 +37,7 @@ if [ -n "$TMP_" ] && [ -d "$TMP_" ]; then
   MARK="${TMP_%/}/dev.ztab.pkg.keep-login-off"
   as_user /bin/rm -f "$MARK"
   # An upgrade on which this user had turned "Start ZTab at login" off (or installed without
-  # it): ZTab was installed (in /Applications, or their per-user copy of earlier versions), they
+  # it): ZTab was installed (in /Applications, or their own per-user copy), they
   # have used it (that copy, its log or its settings folder), and they have no login agent. The
   # shared /Applications copy alone says nothing about this user: another user may have
   # installed it, and then this is their first install, which turns the login item on.
