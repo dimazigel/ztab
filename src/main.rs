@@ -52,7 +52,7 @@ use objc2_foundation::{NSDistributedNotificationCenter, NSNotification, NSNotifi
 
 use hotkey::{Binding, Hotkey, HotkeyEvent, HotkeyHandle, Mods, Which};
 use model::{ModelEvent, OwnWindow, Snapshot, WindowModel};
-use settings::{Paths, Settings, Writer};
+use settings::{FirstLaunch, LoginApplied, Paths, Record, Settings, Writer};
 use settings_window::{MsgKind, SettingsEvent, SettingsWindow};
 use setup::{GrantAction, Perm, Polled, Primary};
 use setup_window::{SetupEvent, SetupWindow};
@@ -96,6 +96,46 @@ const SYMBOL_NORMAL: &str = "rectangle.on.rectangle";
 const SYMBOL_SECURE: &str = "lock.rectangle.on.rectangle";
 /// The status menu item that opens the Set up window.
 const SETUP_MENU_TITLE: &str = "Set Up ZTab…";
+/// The Set up window's line, and the Settings window's message, after ZTab turned its login item
+/// on at its first launch, or could not (see `State::first_launch_login`). The Set up line is one
+/// line of the window's width; the Settings message (two lines) adds the error.
+const LOGIN_NOTE_SETUP: &str = "ZTab will also start when you log in. To turn that off: ZTab's menu-bar icon → Settings…";
+const LOGIN_NOTE_SETTINGS: &str = "ZTab turned this on at its first launch. Untick it to stop ZTab starting at login.";
+const LOGIN_NOTE_SETUP_FAILED: &str = "ZTab could not turn on start at login; it tries again at its next launch.";
+
+/// What the first-launch rule did with the login item in this run, shown until the user changes
+/// the box (see `State::show_login_note`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum LoginNote {
+    #[default]
+    None,
+    /// The login item was turned on.
+    TurnedOn,
+    /// The agent could not be written (the error): it stays off and the next launch tries again.
+    Failed(String),
+}
+
+impl LoginNote {
+    /// The Set up window's line.
+    fn setup(&self) -> (&'static str, MsgKind) {
+        match self {
+            LoginNote::None => ("", MsgKind::Info),
+            LoginNote::TurnedOn => (LOGIN_NOTE_SETUP, MsgKind::Info),
+            LoginNote::Failed(_) => (LOGIN_NOTE_SETUP_FAILED, MsgKind::Error),
+        }
+    }
+
+    /// The Settings window's message.
+    fn settings(&self) -> (String, MsgKind) {
+        match self {
+            LoginNote::None => (String::new(), MsgKind::Info),
+            LoginNote::TurnedOn => (LOGIN_NOTE_SETTINGS.to_string(), MsgKind::Info),
+            LoginNote::Failed(e) => {
+                (format!("ZTab could not turn on start at login by itself ({e}). It tries again at its next launch."), MsgKind::Error)
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Logging (written by a logger thread; the caller only stamps the time and queues the line)
@@ -299,6 +339,10 @@ struct State {
     settings_win: RefCell<Option<Rc<SettingsWindow>>>,
     /// Start-at-login state last read from the agent file (None: not read yet).
     login_state: RefCell<Option<settings::LoginState>>,
+    /// What the first-launch rule did with the login item at this launch (turned it on, or could
+    /// not), until the user changes the box: the Set up and Settings windows say so (see
+    /// `show_login_note`).
+    login_note: RefCell<LoginNote>,
     /// The "Set up ZTab" window, built the first time it is shown, then kept.
     setup_win: RefCell<Option<Rc<SetupWindow>>>,
     /// ZTab's windows that were closed (Settings, Set up) and not shown since: never listed in
@@ -1337,7 +1381,8 @@ impl State {
     fn show_settings(&self) {
         let win = self.build_settings_window("on first open");
         win.set_values(&self.settings.borrow());
-        win.set_message("", MsgKind::Info);
+        let (msg, kind) = self.login_note.borrow().settings();
+        win.set_message(&msg, kind);
         win.set_login(self.login_state.borrow().as_ref().map(|s| s.checked()));
         self.refresh_login_state();
         let t = Instant::now();
@@ -1464,10 +1509,25 @@ impl State {
         if let Some(w) = self.settings_window() {
             w.set_login(None);
         }
+        // The user chose: the first-launch note is over, and ZTab never decides by itself again
+        // (recorded as a line edit on the settings thread, after any save queued before; the
+        // in-memory copy takes it now, so every later save keeps it).
+        if self.login_note.replace(LoginNote::None) != LoginNote::None {
+            self.show_login_note();
+        }
+        let s = *self.settings.borrow();
+        let record = !s.login_item_offered || s.login_item_retry;
+        if record {
+            *self.settings.borrow_mut() = Record::Settled.apply(&s);
+            log(&format!("settings: start at login chosen in Settings: recording {}", Record::Settled.describe()));
+        }
         let paths = self.paths.clone();
         let program = settings::current_program();
         self.writer.run(move || {
             let r = paths.set_login_file(on, &program).map_err(|e| e.to_string());
+            if record && let Err(e) = paths.record(Record::Settled) {
+                log(&format!("settings: could not record the choice: {e}"));
+            }
             let now = paths.login_state(&program);
             log(&format!(
                 "settings: start at login {} -> {} ({}{}){}",
@@ -1491,6 +1551,100 @@ impl State {
                 *st.login_state.borrow_mut() = Some(now);
             });
         });
+    }
+
+    /// The first-launch rule at launch (see `settings::first_launch`): the evidence and the
+    /// decision are a few `stat`s on the main thread (measured and logged; `prior` was taken
+    /// before the log and the instance lock existed); the agent and the record are written on the
+    /// settings thread, and the in-memory settings take the record from that result (a settled
+    /// question, or a retry when the agent could not be written). No `launchctl`: launchd loads
+    /// the agent at the next login, as when the box is ticked (this ZTab runs already). The Set up
+    /// window (if it shows) and the Settings window say in this run that the login item was
+    /// turned on, or could not be.
+    ///
+    /// A known race, left as it is: a settings save queued between the decision and the main
+    /// thread's update (a user change within about a millisecond of launch, before any window can
+    /// take one) writes the old in-memory flags over the record; the next launch then decides
+    /// again from the evidence (the agent, or the traces of this run).
+    fn first_launch_login(&self, prior: settings::PriorRun) {
+        let (d, program, ms) = decide_first_launch(&self.paths, &self.settings.borrow(), prior);
+        let iso = if self.paths.isolated { " [isolated]" } else { "" };
+        let retry = if self.settings.borrow().login_item_retry { " (again: the last launch could not write the agent)" } else { "" };
+        match &d {
+            FirstLaunch::Settled => {
+                log(&format!("login item: settled before (login_item_offered = true){iso}: not changed (checked in {ms:.2} ms)"));
+                return;
+            }
+            FirstLaunch::NotInstalled(why) => {
+                log(&format!("login item: not turned on by itself: this copy is {why} ({program}; checked in {ms:.2} ms)"));
+                return;
+            }
+            FirstLaunch::RanBefore(signs) => log(&format!(
+                "login item: ZTab ran before for this user{iso} (found {}): left as it is, recording that (checked in {ms:.2} ms)",
+                signs.join(", ")
+            )),
+            FirstLaunch::TurnOn => {
+                log(&format!("login item: first launch for this user{iso}: turning start at login on{retry} (checked in {ms:.2} ms)"))
+            }
+        }
+        let paths = self.paths.clone();
+        self.writer.run(move || {
+            let a = paths.apply_first_launch(&d, &program);
+            let now = paths.login_state(&program);
+            log(&format!(
+                "login item: {}{}; start at login is {} ({}){}",
+                a.done.join("; "),
+                if a.errors.is_empty() { String::new() } else { format!("; error: {}", a.errors.join("; ")) },
+                now.describe(),
+                paths.agent_plist.display(),
+                match &a.login {
+                    LoginApplied::TurnedOn if now.checked() => "; ZTab will start when the user logs in (Settings… can turn that off)",
+                    LoginApplied::Failed(_) => "; not turned on: the next launch tries again",
+                    _ => "",
+                }
+            ));
+            DispatchQueue::main().exec_async(move || {
+                let Some(st) = state() else { return };
+                if let Some(r) = a.record {
+                    let s = r.apply(&st.settings.borrow());
+                    *st.settings.borrow_mut() = s;
+                }
+                let note = match a.login {
+                    LoginApplied::TurnedOn if now.checked() => LoginNote::TurnedOn,
+                    LoginApplied::Failed(e) => LoginNote::Failed(e),
+                    _ => LoginNote::None,
+                };
+                if let Some(w) = st.settings_window() {
+                    w.set_login(Some(now.checked()));
+                }
+                *st.login_state.borrow_mut() = Some(now);
+                if note != LoginNote::None {
+                    *st.login_note.borrow_mut() = note;
+                    st.show_login_note();
+                }
+            });
+        });
+    }
+
+    /// What the first-launch rule did at this launch (`login_note`), in the windows that are
+    /// built: the Set up window's login line, the Settings window's message (when it is open).
+    /// Cleared when the user changes the box.
+    fn show_login_note(&self) {
+        let note = self.login_note.borrow().clone();
+        if let Some(w) = self.setup_window() {
+            let (text, kind) = note.setup();
+            w.set_login_note(text, kind);
+            if w.is_visible() {
+                log(&format!("login item: the Set up window's start-at-login line {}", if text.is_empty() { "cleared" } else { "shown" }));
+            }
+        }
+        if note != LoginNote::None
+            && let Some(w) = self.settings_window()
+            && w.is_visible()
+        {
+            let (msg, kind) = note.settings();
+            w.set_message(&msg, kind);
+        }
     }
 
     /// The tap lets every key through while a recorder captures (and only then).
@@ -1722,15 +1876,18 @@ impl State {
             "Everything is set up."
         };
         win.set_message(msg, MsgKind::Info);
+        let (note, note_kind) = self.login_note.borrow().setup();
+        win.set_login_note(note, note_kind);
         let t2 = Instant::now();
         self.set_own_closed(OwnWin::Setup, false);
         win.show(self.mtm);
         self.update_own_windows();
         log(&format!(
-            "setup window shown ({why}): {} in {build_ms:.1} ms, shown in {:.1} ms, wid={}",
+            "setup window shown ({why}): {} in {build_ms:.1} ms, shown in {:.1} ms, wid={}{}",
             if built { "built" } else { "reused" },
             ms_since(t2),
-            win.window().windowNumber()
+            win.window().windowNumber(),
+            if note.is_empty() { "" } else { ", with the start-at-login line" }
         ));
         self.start_setup_poll();
         self.front_setup_later("shown");
@@ -2085,6 +2242,60 @@ impl State {
     }
 }
 
+/// The first-launch rule's inputs and answer for this binary (see `settings::first_launch`):
+/// the answer, the program a login agent would start (`settings::current_program`, a Homebrew keg
+/// named by its stable `opt` path) and the milliseconds it took (a few `stat`s and a `statfs`).
+fn decide_first_launch(paths: &Paths, s: &Settings, prior: settings::PriorRun) -> (FirstLaunch, String, f64) {
+    let t = Instant::now();
+    let program = settings::current_program();
+    let placement = settings::install_placement(&program, settings::read_only_volume(&program));
+    let d = settings::first_launch(&paths.first_launch_evidence(s, prior), placement);
+    (d, program, ms_since(t))
+}
+
+/// `ztab --first-launch-check [--settings-dir <dir>]` (tests, diagnostics): the first-launch rule
+/// as a launch runs it (the same evidence, decision and writes), without the GUI and without the
+/// single-instance lock, so it runs beside a running ZTab. It writes only in the isolated mode;
+/// for the user's own settings it only says what a launch would do. Prints the answer, the login
+/// item and the record; exit 0 (1: a write failed). It writes no log line: a log it created would
+/// itself count as a sign that ZTab ran before.
+fn first_launch_check(paths: &Paths, prior: settings::PriorRun) -> i32 {
+    let (loaded, _, _) = paths.load();
+    let ev = paths.first_launch_evidence(&loaded, prior);
+    let (d, program, ms) = decide_first_launch(paths, &loaded, prior);
+    println!("first launch: {d:?} (program {program}; evidence {ev:?}; decided in {ms:.3} ms)");
+    let mut code = 0;
+    if paths.isolated {
+        let a = paths.apply_first_launch(&d, &program);
+        println!(
+            "applied: login item {:?}; record {:?}; {}",
+            a.login,
+            a.record,
+            if a.done.is_empty() { "nothing to do".to_string() } else { a.done.join("; ") }
+        );
+        if !a.errors.is_empty() {
+            println!("error: {}", a.errors.join("; "));
+            code = 1;
+        }
+    } else {
+        println!("dry run: --first-launch-check never changes the user's own settings or login item");
+    }
+    println!(
+        "start at login: {} ({}){}",
+        paths.login_state(&program).describe(),
+        paths.agent_plist.display(),
+        paths.login_program().map(|p| format!(" program {p}")).unwrap_or_default()
+    );
+    let after = paths.load().0;
+    println!(
+        "settings: login_item_offered = {} login_item_retry = {} ({})",
+        after.login_item_offered,
+        after.login_item_retry,
+        paths.settings_file.display()
+    );
+    code
+}
+
 /// The Settings window's warning for a login agent that would not start this ZTab.
 fn login_warning(state: &settings::LoginState) -> Option<String> {
     match state {
@@ -2417,6 +2628,7 @@ fn make_state(mtm: MainThreadMarker, paths: Paths, settings: Settings) -> Rc<Sta
         writer: Writer::new(log),
         settings_win: RefCell::new(None),
         login_state: RefCell::new(None),
+        login_note: RefCell::new(LoginNote::None),
         setup_win: RefCell::new(None),
         own_closed: Cell::new([true, true]),
         setup: RefCell::new(SetupCtl::default()),
@@ -3043,6 +3255,10 @@ fn main() {
 
     // Settings location: the user's, or `--settings-dir <dir>` / $ZTAB_SETTINGS_DIR (tests).
     let paths = Paths::from_args(&args);
+    // Traces of an earlier run for the first-launch rule, before this run makes them: nothing
+    // has logged yet (the first line creates the log) and the instance lock (its file) is not
+    // taken yet. Three `stat`s.
+    let prior = settings::PriorRun::capture(std::path::Path::new(&log_path()));
 
     // Command line: the login item (scripts/install.sh --login runs `ztab --set-login on`).
     if let Some(v) = arg_value(&args, "--set-login") {
@@ -3082,6 +3298,11 @@ fn main() {
             settings::LoginState::Off => 1,
             settings::LoginState::Elsewhere { .. } => 3,
         });
+    }
+
+    if args.iter().any(|a| a == "--first-launch-check") {
+        // No log line (see `first_launch_check`), so nothing to flush.
+        std::process::exit(first_launch_check(&paths, prior));
     }
 
     let diag = ["--snapshot", "--dump-model", "--panel-bench", "--label-check"].iter().any(|f| args.iter().any(|a| a == f));
@@ -3169,6 +3390,9 @@ fn main() {
     for n in notes {
         log(&format!("settings: {n}"));
     }
+    // Start at login on the very first launch (after the diagnostics modes returned above, and
+    // only in the ZTab that holds the instance lock).
+    st.first_launch_login(prior);
 
     // Permissions are only checked here, never requested (no system dialog at launch): when one
     // is missing the Set up window opens, and its buttons ask macOS (see setup.rs). It also opens

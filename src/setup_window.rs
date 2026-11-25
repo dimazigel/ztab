@@ -1,11 +1,12 @@
 //! The "Set up ZTab" window (main thread only): one row per permission (status and a "Grant…"
 //! button), a message line, "Restart ZTab" and the main button (Done / Skip Thumbnails / Later).
 //! It only reports what the user did ([`SetupEvent`]) and shows what it is told; `main.rs`
-//! decides (with `setup.rs`).
+//! decides (with `setup.rs`). A line under the message says when ZTab turned its login item on at
+//! this, its first, launch, or could not (empty otherwise).
 //!
 //! Accessibility identifiers for the end-to-end test: `ztab.setup.ax.status`,
 //! `ztab.setup.ax.grant`, `ztab.setup.screen.status`, `ztab.setup.screen.grant`,
-//! `ztab.setup.message`, `ztab.setup.restart`, `ztab.setup.primary`.
+//! `ztab.setup.message`, `ztab.setup.login`, `ztab.setup.restart`, `ztab.setup.primary`.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -24,7 +25,7 @@ use crate::setup::{Perm, Primary, ScreenRow};
 
 pub const WINDOW_TITLE: &str = "Set up ZTab";
 const W: f64 = 600.0;
-const H: f64 = 300.0;
+const H: f64 = 322.0;
 
 /// What the user did in the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +126,7 @@ pub struct SetupWindow {
     ax: Row,
     screen: Row,
     message: Retained<NSTextField>,
+    login_note: Retained<NSTextField>,
     primary: Retained<NSButton>,
     primary_kind: Cell<Primary>,
     placed: Cell<bool>,
@@ -221,11 +223,15 @@ impl SetupWindow {
         let message = label(mtm, "", NSFont::systemFontOfSize(12.0), true);
         set_id(&message, "ztab.setup.message");
         add(&message, x0, 206.0, W - 2.0 * x0, 36.0);
+        // One line: the login item was turned on at this first launch (see `set_login_note`).
+        let login_note = label(mtm, "", NSFont::systemFontOfSize(12.0), true);
+        set_id(&login_note, "ztab.setup.login");
+        add(&login_note, x0, 244.0, W - 2.0 * x0, 18.0);
 
         let restart = button("Restart ZTab", sel!(restartZTab:), "ztab.setup.restart");
-        add(&restart, x0 - 6.0, 252.0, 150.0, 30.0);
+        add(&restart, x0 - 6.0, 274.0, 150.0, 30.0);
         let primary = button("Done", sel!(primaryClicked:), "ztab.setup.primary");
-        add(&primary, W - x0 - 170.0 + 6.0, 252.0, 170.0, 30.0);
+        add(&primary, W - x0 - 170.0 + 6.0, 274.0, 170.0, 30.0);
 
         SetupWindow {
             window,
@@ -233,6 +239,7 @@ impl SetupWindow {
             ax,
             screen,
             message,
+            login_note,
             primary,
             primary_kind: Cell::new(Primary::Done),
             placed: Cell::new(false),
@@ -319,6 +326,18 @@ impl SetupWindow {
 
     pub fn primary(&self) -> Primary {
         self.primary_kind.get()
+    }
+
+    /// The login line: ZTab turned its login item on at this launch, or could not (empty: no
+    /// line).
+    pub fn set_login_note(&self, text: &str, kind: MsgKind) {
+        let color = match kind {
+            MsgKind::Info => NSColor::secondaryLabelColor(),
+            MsgKind::Warning => NSColor::systemOrangeColor(),
+            MsgKind::Error => NSColor::systemRedColor(),
+        };
+        self.login_note.setTextColor(Some(&color));
+        self.login_note.setStringValue(&NSString::from_str(text));
     }
 
     pub fn set_message(&self, text: &str, kind: MsgKind) {

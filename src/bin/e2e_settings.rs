@@ -19,9 +19,18 @@
 //!     back to A;
 //!  F) "Restore defaults": ⌥Tab / ⌥` / 120 ms again (titles, label, file); ⌥Tab opens the
 //!     switcher, ⌃F18 does not;
-//!  G) start at login in the isolated mode: the checkbox writes `<dir>/LaunchAgents/
-//!     dev.ztab.app.plist` (valid, runs ZTab's binary directly) and deletes it again; the real
-//!     `~/Library/LaunchAgents/dev.ztab.app.plist` is not touched;
+//!  G) start at login in the isolated mode. First what ZTab's first launch did with the
+//!     directory, against an expectation this suite derives for itself (or takes from
+//!     `--expect-first-launch on|off|kept`, see `FirstLaunchExpect`): `on` (an installed ZTab, in
+//!     /Applications or ~/Applications, started without a settings file or an agent): the box is
+//!     ticked, the agent was written after ZTab started and runs its binary, and
+//!     `login_item_offered = true` is in the settings; `kept` (an agent older than ZTab's start,
+//!     such as `run_round.sh`'s STALE_AGENT one, or a settings file at its start): the agent is as
+//!     it was, the box shows whether it runs this binary, and the question is recorded; `off`
+//!     (not an installed copy: no bundle, target/ or dist/): no agent, unticked, nothing recorded.
+//!     Then the checkbox (unticked first when it is ticked) writes `<dir>/LaunchAgents/
+//!     dev.ztab.app.plist` (valid, runs ZTab's binary directly, replacing a stale agent) and
+//!     deletes it again; the real `~/Library/LaunchAgents/dev.ztab.app.plist` is not touched;
 //!  H) closing the window (its close button, through AX) while it is key gives the focus back
 //!     to the most recent window (A);
 //!  I) it cannot be minimized (minimizing runs the system's animation on ZTab's main thread for
@@ -31,7 +40,8 @@
 //! Only keys ZTab swallows, or that are inert in a scratch Finder window (⌥Tab, ⌃F18, F18), are
 //! posted, and only while that scratch window or ZTab's own window is in front.
 //!
-//! Usage: `open -W -n -g <bundle> --args <out.txt> <scratch-dir> <settings-dir>`.
+//! Usage: `open -W -n -g <bundle> --args <out.txt> <scratch-dir> <settings-dir>
+//! [--expect-first-launch on|off|kept]`.
 
 #[path = "../windows.rs"]
 #[allow(dead_code)]
@@ -464,6 +474,52 @@ fn wait_settings(dir: &str, lines: &[&str]) -> bool {
     .is_some()
 }
 
+/// What ZTab's first launch should have done with the isolated login item (check G).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FirstLaunchExpect {
+    /// Turned on: ticked, an agent written after ZTab started that runs its binary, recorded.
+    On,
+    /// Left as it was (ZTab ran before with this directory): the agent unchanged since before
+    /// ZTab started (or none), the box ticked only if it runs this binary, recorded.
+    Kept,
+    /// Not an installed copy: no agent, unticked, nothing recorded.
+    Off,
+    /// This suite cannot tell (why): pass `--expect-first-launch`.
+    Unknown(String),
+}
+
+/// The expectation for G, independent of ZTab's own decision (not read from its log):
+/// `--expect-first-launch` when given; else from the binary's place (in /Applications or
+/// ~/Applications: installed; outside an app bundle, or under target/ or dist/: not installed;
+/// anything else: unknown) and, for an installed copy, from what was there when ZTab started: an
+/// agent file older than ZTab's start (`pre_seeded`) or a settings file (`no file: defaults`
+/// missing from ZTab's settings line) means it ran before (`Kept`), nothing means `On`.
+fn first_launch_expect(flag: Option<&str>, bin: &str, home: &str, pre_seeded: bool, settings_existed: bool) -> FirstLaunchExpect {
+    match flag {
+        Some("on") => return FirstLaunchExpect::On,
+        Some("off") => return FirstLaunchExpect::Off,
+        Some("kept") => return FirstLaunchExpect::Kept,
+        Some(v) => return FirstLaunchExpect::Unknown(format!("--expect-first-launch {v:?}: not on, off or kept")),
+        None => {}
+    }
+    let installed = bin.starts_with("/Applications/") || bin.starts_with(&format!("{home}/Applications/"));
+    let not_installed = !bin.contains(".app/Contents/MacOS/") || bin.contains("/target/") || bin.contains("/dist/");
+    if not_installed {
+        FirstLaunchExpect::Off
+    } else if !installed {
+        FirstLaunchExpect::Unknown(format!("{bin} is neither in /Applications nor clearly a build; pass --expect-first-launch on|off|kept"))
+    } else if pre_seeded || settings_existed {
+        FirstLaunchExpect::Kept
+    } else {
+        FirstLaunchExpect::On
+    }
+}
+
+fn mtime_secs(p: &std::path::Path) -> Option<f64> {
+    let t = std::fs::metadata(p).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
+}
+
 fn binary_path(pid: i32) -> String {
     let o = Command::new("ps").args(["-o", "comm=", "-p", &pid.to_string()]).output().unwrap();
     String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -553,9 +609,10 @@ fn main() {
     let mut out = Out { f, pass: true };
     let scratch = args.get(2).cloned().unwrap_or_else(|| "/tmp".into());
     let Some(sdir) = args.get(3).cloned() else {
-        let _ = writeln!(out.f, "usage: e2e_settings <out> <scratch-dir> <settings-dir>\nRESULT FAIL");
+        let _ = writeln!(out.f, "usage: e2e_settings <out> <scratch-dir> <settings-dir> [--expect-first-launch on|off|kept]\nRESULT FAIL");
         return;
     };
+    let expect_flag = args.iter().position(|a| a == "--expect-first-launch").and_then(|i| args.get(i + 1)).cloned();
     let _activity = objc2_foundation::NSProcessInfo::processInfo().beginActivityWithOptions_reason(
         objc2_foundation::NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | objc2_foundation::NSActivityOptions::LatencyCritical,
         &NSString::from_str("ZTab end-to-end timings"),
@@ -568,6 +625,7 @@ fn main() {
     // Guard: ZTab must be using exactly this isolated settings directory.
     let lines = log_since(0.0);
     let started = lines.iter().rposition(|(_, m)| m.starts_with(&format!("starting pid={pid} ")));
+    let started_at = started.map(|i| lines[i].0).unwrap_or(0.0);
     let settings_line = started.and_then(|i| lines[i..].iter().find(|(_, m)| m.starts_with("settings: /")).map(|(_, m)| m.clone()));
     let want = format!("settings: {sdir}/settings.conf [isolated]");
     let isolated = settings_line.as_deref().is_some_and(|l| l.starts_with(&want));
@@ -585,7 +643,11 @@ fn main() {
     let dir_a = format!("{scratch}/settings-A");
     start_sentinel();
     let ui = Ui::new(pid);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut out, pid, &ui, &sdir, &dir_a)));
+    // For G: what was there when ZTab started (its settings line says whether a settings file was).
+    // Positive evidence only: an unrecognised line counts as "no file", so G expects `on` (strict).
+    let settings_existed = settings_line.as_deref().is_some_and(|l| l.contains(" (loaded, "));
+    let fl = FirstLaunchCtx { started_at, settings_existed, flag: expect_flag, home: home.to_string_lossy().into_owned() };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut out, pid, &ui, &sdir, &dir_a, &fl)));
     if r.is_err() {
         out.check("panic", false, "suite panicked".into());
     }
@@ -631,7 +693,17 @@ fn main() {
     let _ = writeln!(out.f, "RESULT {}", if out.pass { "PASS" } else { "FAIL" });
 }
 
-fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
+/// What G needs to know about ZTab's launch (see `first_launch_expect`).
+struct FirstLaunchCtx {
+    /// ZTab's `starting pid=` log line time (epoch seconds).
+    started_at: f64,
+    /// A settings file was there when ZTab started.
+    settings_existed: bool,
+    flag: Option<String>,
+    home: String,
+}
+
+fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str, fl: &FirstLaunchCtx) {
     // Scratch window A in front, so the Settings window has a "previous" window.
     let Some(a) = front_finder(dir_a) else {
         out.check("setup: scratch Finder window A in front", false, "not found".into());
@@ -847,23 +919,60 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
         format!("⌥Tab open={} shown={}; ⌃F18 opened={opened_f18} f18_at_session={}", open.is_some(), shown.is_some(), seen_keys_since(t, F18)),
     );
 
-    // G) Start at login, isolated.
+    // G) Start at login, isolated: first what ZTab's first launch did with the directory (see
+    // `first_launch_expect`), then the checkbox.
     let agent = format!("{sdir}/LaunchAgents/dev.ztab.app.plist");
+    let agent_path = std::path::Path::new(&agent);
+    let bin = binary_path(pid);
+    let execs_bin = |text: &str| !bin.is_empty() && text.contains(&format!("<string>{bin}</string>")) && !text.contains("/usr/bin/open");
+    let agent_text = std::fs::read_to_string(&agent).unwrap_or_default();
+    let agent_mtime = mtime_secs(agent_path);
+    // The log stamps are rounded to the millisecond: 2 ms of margin (a pre-seeded agent is written
+    // well before ZTab even starts; ZTab's own write comes after its `starting` line).
+    let pre_seeded = agent_mtime.is_some_and(|t| t < fl.started_at - 0.002);
+    let expect = first_launch_expect(fl.flag.as_deref(), &bin, &fl.home, pre_seeded, fl.settings_existed);
+    let first = wait_for(3.0, || ui.el("ztab.login").and_then(|e| num_attr(&e, "AXValue")).filter(|v| *v == 0.0 || *v == 1.0));
+    let recorded = settings_text(sdir).contains("\nlogin_item_offered = true\n");
+    let runs_bin = execs_bin(&agent_text);
+    let first_launch_ok = match &expect {
+        FirstLaunchExpect::On => first == Some(1.0) && runs_bin && agent_mtime.is_some() && !pre_seeded && recorded,
+        FirstLaunchExpect::Kept => first == Some(if runs_bin { 1.0 } else { 0.0 }) && (agent_mtime.is_none() || pre_seeded) && recorded,
+        FirstLaunchExpect::Off => first == Some(0.0) && agent_mtime.is_none() && !recorded,
+        FirstLaunchExpect::Unknown(_) => false,
+    };
+    out.note(format!(
+        "G: first launch expected {expect:?} (flag {:?}, ZTab started at {:.3}, settings file then: {}): box={first:?} agent mtime={agent_mtime:?} \
+         pre_seeded={pre_seeded} runs the binary={runs_bin} recorded={recorded} -> {first_launch_ok}",
+        fl.flag, fl.started_at, fl.settings_existed
+    ));
+    // A ticked box is unticked first, so the checkbox sequence below starts from off.
+    let untick_ok = if first == Some(1.0) {
+        let p0 = ui.press("ztab.login");
+        let removed0 = wait_for(3.0, || (!agent_path.exists()).then_some(()));
+        let off0 = wait_for(2.0, || ui.el("ztab.login").and_then(|e| num_attr(&e, "AXValue")).filter(|v| *v == 0.0));
+        out.note(format!("G: unticked first: removed={} unchecked={}", removed0.is_some(), off0.is_some()));
+        p0 == Some(AXError::Success) && removed0.is_some() && off0.is_some()
+    } else {
+        true
+    };
     let before = num_attr(&ui.el("ztab.login").unwrap_or_else(|| ui.app.clone()), "AXValue");
     let enabled = ui.el("ztab.login").and_then(|e| num_attr(&e, "AXEnabled"));
     let pressed = ui.press("ztab.login");
-    let written = wait_for(3.0, || std::path::Path::new(&agent).exists().then_some(()));
+    // Written for this binary (a stale agent from before is already there: wait for the content).
+    let written = wait_for(3.0, || execs_bin(&std::fs::read_to_string(&agent).unwrap_or_default()).then_some(()));
     let lint = Command::new("/usr/bin/plutil").args(["-lint", &agent]).output().map(|o| o.status.success()).unwrap_or(false);
-    let bin = binary_path(pid);
     let text = std::fs::read_to_string(&agent).unwrap_or_default();
-    let execs = !bin.is_empty() && text.contains(&format!("<string>{bin}</string>")) && !text.contains("/usr/bin/open");
+    let execs = execs_bin(&text);
     let on = wait_for(2.0, || ui.el("ztab.login").and_then(|e| num_attr(&e, "AXValue")).filter(|v| *v == 1.0));
     let pressed2 = ui.press("ztab.login");
     let removed = wait_for(3.0, || (!std::path::Path::new(&agent).exists()).then_some(()));
     let off = wait_for(2.0, || ui.el("ztab.login").and_then(|e| num_attr(&e, "AXValue")).filter(|v| *v == 0.0));
     out.check(
         "G/start at login writes and removes the isolated agent (valid plist, runs the binary)",
-        before == Some(0.0)
+        first_launch_ok
+            && untick_ok
+            && settings_text(sdir).contains("\nlogin_item_offered = true\n")
+            && before == Some(0.0)
             && enabled == Some(1.0)
             && pressed == Some(AXError::Success)
             && written.is_some()
@@ -874,7 +983,7 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
             && removed.is_some()
             && off.is_some(),
         format!(
-            "before={before:?} enabled={enabled:?} written={} lint={lint} execs_binary={execs} ({bin}) checked={} removed={} unchecked={}",
+            "first launch {expect:?}: box={first:?} ok={first_launch_ok} untick_ok={untick_ok}; before={before:?} enabled={enabled:?} written={} lint={lint} execs_binary={execs} ({bin}) checked={} removed={} unchecked={}",
             written.is_some(),
             on.is_some(),
             removed.is_some(),
@@ -930,4 +1039,31 @@ fn run(out: &mut Out, pid: i32, ui: &Ui, sdir: &str, dir_a: &str) {
             frontmost_pid()
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FirstLaunchExpect as E, first_launch_expect as expect};
+
+    #[test]
+    fn first_launch_expectation() {
+        let app = "/Applications/ZTab.app/Contents/MacOS/ztab";
+        let h = "/Users/a";
+        // run_round.sh: a fresh, empty directory and the installed ZTab.
+        assert_eq!(expect(None, app, h, false, false), E::On);
+        assert_eq!(expect(None, "/Users/a/Applications/ZTab.app/Contents/MacOS/ztab", h, false, false), E::On);
+        // Its STALE_AGENT mode (an agent from before ZTab started), or a settings file then.
+        assert_eq!(expect(None, app, h, true, false), E::Kept);
+        assert_eq!(expect(None, app, h, true, true), E::Kept);
+        assert_eq!(expect(None, app, h, false, true), E::Kept);
+        // Not an installed copy, whatever was there.
+        assert_eq!(expect(None, "/Users/a/src/ztab/target/release/ztab", h, false, false), E::Off);
+        assert_eq!(expect(None, "/Users/a/src/ztab/dist/ZTab.app/Contents/MacOS/ztab", h, true, true), E::Off);
+        // Anything else needs the flag, which always wins.
+        assert!(matches!(expect(None, "/Users/a/x/ZTab.app/Contents/MacOS/ztab", h, false, false), E::Unknown(_)));
+        assert_eq!(expect(Some("on"), "/Users/a/x/ZTab.app/Contents/MacOS/ztab", h, false, false), E::On);
+        assert_eq!(expect(Some("kept"), app, h, false, false), E::Kept);
+        assert_eq!(expect(Some("off"), app, h, false, false), E::Off);
+        assert!(matches!(expect(Some("yes"), app, h, false, false), E::Unknown(_)));
+    }
 }

@@ -11,7 +11,8 @@
 #        note);
 #     3. if ZTab is not running a few seconds later (launchd refused the job, or the login item
 #        stays off), it is started directly.
-#    Other users turn on "Start ZTab at login" in ZTab's Settings; an old per-user copy of theirs
+#    Other users open ZTab once: its first launch for them turns their login item on (or they tick
+#    "Start ZTab at login" in ZTab's Settings, if they used ZTab before); an old per-user copy of theirs
 #    is theirs to remove (it is reported here, see the README). With nobody at the screen (an
 #    install over ssh) only the app is installed.
 #  - for me only: ~/Applications/ZTab.app, no administrator password; runs as that user. Steps 2
@@ -36,7 +37,7 @@ fi
 case "$USER_NAME" in
   "" | root | loginwindow | _mbsetupuser)
     echo "ZTab postinstall: nobody is logged in at the screen (console user '${USER_NAME}'): installed $APP only." \
-      "Each user starts ZTab from Applications and turns on Start at login in its Settings."
+      "Each user opens ZTab from Applications once; its first launch for them turns on start at login."
     exit 0 ;;
 esac
 UID_=$(id -u "$USER_NAME") || exit 0
@@ -97,6 +98,8 @@ done
 running() { pgrep -u "$UID_" -f "^$BIN" >/dev/null; }
 if [ "$KEEP_OFF" = 1 ]; then
   echo "ZTab postinstall: start at login was off for $USER_NAME; leaving it off"
+  # Recorded in their settings (login_item_offered), so ZTab's first launch leaves it off too.
+  as_user /usr/bin/env -u ZTAB_SETTINGS_DIR "$BIN" --set-login off >/dev/null 2>&1 || true
 elif ! as_user /usr/bin/env -u ZTAB_SETTINGS_DIR "$BIN" --set-login on; then
   echo "ZTab postinstall: the login item was not loaded" >&2
 fi

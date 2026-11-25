@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "ztab"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "block2",
  "dispatch2",

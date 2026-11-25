@@ -16,7 +16,8 @@
 # ~/Library/LaunchAgents/dev.ztab.app.plist (launchd runs /Applications/ZTab.app/Contents/MacOS/ztab
 # directly) and loads it into launchd, which starts ZTab right away (RunAtLoad), exactly as at
 # login. With --no-login it is left off, unless it was on (then it is pointed at the new copy, so
-# it does not start a removed one). If launchd refuses the job (for example ZTab is switched off
+# it does not start a removed one); left off, that choice is recorded (`ztab --set-login off`), so
+# ZTab's first launch does not turn it on by itself. If launchd refuses the job (for example ZTab is switched off
 # under System Settings > General > Login Items > Allow in the Background), ZTab is started
 # directly instead, so it is never left stopped.
 #
@@ -86,6 +87,8 @@ if [ "$LOGIN" = 1 ] || [ -f "$AGENT" ]; then
     open -g "$DEST"
   fi
 else
+  # Recorded in the settings (login_item_offered), so ZTab's first launch leaves it off.
+  env -u ZTAB_SETTINGS_DIR "$DEST/Contents/MacOS/ztab" --set-login off >/dev/null || true
   open -g "$DEST"
 fi
 echo "installed $DEST"

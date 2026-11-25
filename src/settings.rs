@@ -15,6 +15,12 @@
 //!   next login; unloading it now would kill a ZTab that launchd started). The command line
 //!   (`ztab --set-login on|off`, used by `scripts/install.sh --login`) also boots the job in or
 //!   out of launchd.
+//! * First launch ([`first_launch`]): ZTab turns its login item on by itself only on the very
+//!   first launch of an installed copy for this user, and records in the settings
+//!   (`login_item_offered`) that the question is settled, so it never does it again (see the rule
+//!   there). When the agent cannot be written it records `login_item_retry` instead and the next
+//!   launch tries again. These records edit their line of the settings file ([`Paths::record`]);
+//!   the rest of the file stays as it was.
 //! * Disk writes happen on the `ztab-settings` thread ([`Writer`]); saves are coalesced.
 
 use std::io::Write as _;
@@ -42,6 +48,16 @@ pub struct Settings {
     /// shows only once per app: a later "Grant…" opens System Settings directly. "Restore
     /// defaults" keeps it.
     pub screen_recording_requested: bool,
+    /// The start-at-login question is settled for this user: ZTab turned the login item on at its
+    /// first launch, found that it had run before, or the user (checkbox) or an installer
+    /// (`--set-login`) chose. From then on ZTab never turns the login item on by itself (see
+    /// [`first_launch`]). "Restore defaults" keeps it.
+    pub login_item_offered: bool,
+    /// The first launch tried to turn the login item on and could not write the agent: the
+    /// question stays open and the next launch tries again (the settings file and the log that
+    /// this launch left do not count as an earlier run then; see [`first_launch`]). Written only
+    /// while it is true; the checkbox and `--set-login` clear it. "Restore defaults" keeps it.
+    pub login_item_retry: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +67,8 @@ impl Default for Settings {
             hotkeys: Bindings::default(),
             skip_screen_recording: false,
             screen_recording_requested: false,
+            login_item_offered: false,
+            login_item_retry: false,
         }
     }
 }
@@ -58,21 +76,25 @@ impl Default for Settings {
 impl Settings {
     pub fn describe(&self) -> String {
         format!(
-            "show_delay_ms={} hotkey_all={} hotkey_same_app={} skip_screen_recording={} screen_recording_requested={}",
+            "show_delay_ms={} hotkey_all={} hotkey_same_app={} skip_screen_recording={} screen_recording_requested={} login_item_offered={}{}",
             self.show_delay_ms,
             self.hotkeys.all.label(),
             self.hotkeys.same_app.label(),
             self.skip_screen_recording,
-            self.screen_recording_requested
+            self.screen_recording_requested,
+            self.login_item_offered,
+            if self.login_item_retry { " login_item_retry=true" } else { "" }
         )
     }
 
-    /// "Restore defaults": the default delay and shortcuts; the Set up window's choice and what
-    /// ZTab asked macOS for stay.
+    /// "Restore defaults": the default delay and shortcuts; the Set up window's choice, what ZTab
+    /// asked macOS for and the settled login-item question stay.
     pub fn restored(&self) -> Settings {
         Settings {
             skip_screen_recording: self.skip_screen_recording,
             screen_recording_requested: self.screen_recording_requested,
+            login_item_offered: self.login_item_offered,
+            login_item_retry: self.login_item_retry,
             ..Settings::default()
         }
     }
@@ -105,7 +127,7 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
                 }
                 Err(_) => notes.push(format!("show_delay_ms: not a number: {v:?}")),
             },
-            "skip_screen_recording" | "screen_recording_requested" => {
+            "skip_screen_recording" | "screen_recording_requested" | "login_item_offered" | "login_item_retry" => {
                 let b = match v {
                     "true" | "1" => true,
                     "false" | "0" => false,
@@ -114,10 +136,11 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
                         continue;
                     }
                 };
-                if k == "skip_screen_recording" {
-                    s.skip_screen_recording = b;
-                } else {
-                    s.screen_recording_requested = b;
+                match k {
+                    "skip_screen_recording" => s.skip_screen_recording = b,
+                    "screen_recording_requested" => s.screen_recording_requested = b,
+                    "login_item_offered" => s.login_item_offered = b,
+                    _ => s.login_item_retry = b,
                 }
             }
             "hotkey_all" | "hotkey_same_app" => match Binding::parse_conf(v) {
@@ -157,12 +180,15 @@ pub fn serialize(s: &Settings) -> String {
          hotkey_all = {}\n\
          hotkey_same_app = {}\n\
          skip_screen_recording = {}\n\
-         screen_recording_requested = {}\n",
+         screen_recording_requested = {}\n\
+         login_item_offered = {}\n{}",
         s.show_delay_ms,
         s.hotkeys.all.to_conf(),
         s.hotkeys.same_app.to_conf(),
         s.skip_screen_recording,
-        s.screen_recording_requested
+        s.screen_recording_requested,
+        s.login_item_offered,
+        if s.login_item_retry { "login_item_retry = true\n" } else { "" }
     )
 }
 
@@ -387,10 +413,334 @@ pub fn stable_program(path: &str, canon: impl Fn(&str) -> Option<String>) -> Str
     if canon(&opt).as_deref() == Some(path) { opt } else { path.to_string() }
 }
 
+// ---------------------------------------------------------------------------------------------
+// First launch: ZTab turns its login item on by itself, once
+// ---------------------------------------------------------------------------------------------
+
+/// Traces that an earlier run of ZTab leaves for this user outside the settings folder, and that
+/// this run creates itself: the log (`~/Library/Logs/ztab.log`, or `ztab.log.1` after a rotation;
+/// the first log line creates it) and the single-instance lock file in the user's temporary folder
+/// (taking the lock creates it). So they are read at launch before the first log line and before
+/// the lock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PriorRun {
+    pub log: bool,
+    pub lock_file: bool,
+}
+
+impl PriorRun {
+    /// Three `stat`s (microseconds; on the main thread at launch).
+    pub fn capture(log: &Path) -> PriorRun {
+        let rotated = PathBuf::from(format!("{}.1", log.display()));
+        PriorRun { log: exists(log) || exists(&rotated), lock_file: exists(&lock_path()) }
+    }
+}
+
+/// A file (or a symbolic link, even a broken one) is at `p`.
+fn exists(p: &Path) -> bool {
+    p.symlink_metadata().is_ok()
+}
+
+/// What the first-launch rule ([`first_launch`]) looks at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evidence {
+    /// `login_item_offered = true` in the settings.
+    pub recorded: bool,
+    /// `login_item_retry = true` in the settings: an earlier first launch could not write the
+    /// agent, so the traces it left (settings file and folder, log, lock file) do not count.
+    pub retry: bool,
+    /// A file is at the login agent's path (whatever it contains).
+    pub agent: bool,
+    /// The settings file exists.
+    pub settings_file: bool,
+    /// The settings folder exists (`~/Library/Application Support/ZTab`; only ZTab creates it).
+    pub settings_folder: bool,
+    /// Traces outside the settings folder (see [`PriorRun`]).
+    pub prior: PriorRun,
+    /// The isolated test mode: the settings folder is the test's own directory, and the log and
+    /// the lock file belong to the real user, so only the record, the settings file and the agent
+    /// file count.
+    pub isolated: bool,
+}
+
+/// The first-launch rule's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FirstLaunch {
+    /// The question is settled (`login_item_offered`): nothing to do.
+    Settled,
+    /// This copy is not an installed app (why): nothing is changed or recorded.
+    NotInstalled(&'static str),
+    /// ZTab ran before for this user (the signs): the login item stays as it is, on or off (a
+    /// user who turned it off keeps it off), and the question is recorded as settled.
+    RanBefore(Vec<&'static str>),
+    /// The very first launch for this user (or a retry, see [`Settings::login_item_retry`]): turn
+    /// the login item on and record that; if the agent cannot be written, record a retry instead.
+    TurnOn,
+}
+
+/// The first-launch rule. ZTab turns its login item on by itself only on the very first launch of
+/// an installed copy for this user, so opening the app once (a Homebrew install, which cannot do
+/// it while installing) is enough:
+///
+/// 1. `login_item_offered = true` in the settings: settled, nothing happens. Outcomes 3 and 4
+///    record it (4 only once the agent is written), and so do the Settings checkbox and
+///    `ztab --set-login on|off`.
+/// 2. Not an installed copy ([`install_placement`]): nothing happens and nothing is recorded.
+/// 3. Any sign that ZTab ran before for this user: a file at the login agent's path, the settings
+///    file, the settings folder, the log (`ztab.log` or `ztab.log.1`) or the single-instance lock
+///    file as found before this run made them. Then the login item stays as it is and the
+///    question is recorded: a user who had turned it off (unticking deletes the agent and may
+///    leave no settings file) never gets it back. In the isolated test mode only the settings
+///    file and the agent file inside the test directory count (see [`Evidence::isolated`]). After
+///    a failed first launch (`login_item_retry = true`) only an agent file counts: the other
+///    traces are that launch's own.
+/// 4. Otherwise: the first launch. Turn the login item on (write the agent for this binary) and
+///    record it. When the agent cannot be written (an unwritable `~/Library/LaunchAgents`, a full
+///    disk), record `login_item_retry = true` instead, so the next launch tries again.
+///
+/// The records are line edits of the settings file ([`Paths::record`]), so the rest of the file
+/// stays exactly as it was.
+pub fn first_launch(ev: &Evidence, placement: Result<(), &'static str>) -> FirstLaunch {
+    if ev.recorded {
+        return FirstLaunch::Settled;
+    }
+    if let Err(why) = placement {
+        return FirstLaunch::NotInstalled(why);
+    }
+    let mut signs = Vec::new();
+    if ev.agent {
+        signs.push("a login agent file");
+    }
+    if ev.settings_file && !ev.retry {
+        signs.push("the settings file");
+    }
+    if !ev.isolated && !ev.retry {
+        if ev.settings_folder {
+            signs.push("the settings folder");
+        }
+        if ev.prior.log {
+            signs.push("the log");
+        }
+        if ev.prior.lock_file {
+            signs.push("the instance lock file");
+        }
+    }
+    if signs.is_empty() { FirstLaunch::TurnOn } else { FirstLaunch::RanBefore(signs) }
+}
+
+/// Whether `program` (this binary, as [`current_program`] names it) is an installed copy, the only
+/// kind that turns the login item on by itself: inside an app bundle; not run through App
+/// Translocation (a downloaded copy opened where it lies, from a randomised read-only path); not on
+/// a mounted volume (`/Volumes/…`, such as a disk image) or a read-only file system
+/// (`read_only`); not a build's output (`target/debug|release/…`, or a bundle directly in a `dist`
+/// or `target` folder, as `scripts/bundle.sh` makes it); not in a temporary folder.
+pub fn install_placement(program: &str, read_only: bool) -> Result<(), &'static str> {
+    let Some(i) = program.find(".app/Contents/MacOS/") else {
+        return Err("not inside an app bundle");
+    };
+    if program.contains("/AppTranslocation/") {
+        return Err("run through App Translocation (a downloaded copy opened where it lies)");
+    }
+    if program.starts_with("/Volumes/") {
+        return Err("on a mounted volume (/Volumes)");
+    }
+    if read_only {
+        return Err("on a read-only volume");
+    }
+    if program.contains("/target/debug/") || program.contains("/target/release/") {
+        return Err("a cargo build (target/)");
+    }
+    let bundle_dir = Path::new(&program[..i + ".app".len()]).parent().and_then(|d| d.file_name()).and_then(|n| n.to_str());
+    if matches!(bundle_dir, Some("dist" | "target")) {
+        return Err("a build's bundle (dist/ or target/)");
+    }
+    if ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"].iter().any(|t| program.starts_with(t)) {
+        return Err("in a temporary folder");
+    }
+    Ok(())
+}
+
+/// The file system holding `path` is mounted read-only (one `statfs`).
+pub fn read_only_volume(path: &str) -> bool {
+    let Ok(c) = std::ffi::CString::new(path) else { return false };
+    // SAFETY: statfs is plain old data; the call fills it for a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statfs(c.as_ptr(), &mut st) }) == 0 && (st.f_flags & libc::MNT_RDONLY as u32) != 0
+}
+
+/// What the settings record about the start-at-login question ([`Paths::record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Record {
+    /// Settled: `login_item_offered = true`, and no `login_item_retry` line.
+    Settled,
+    /// Still open, tried again at the next launch: `login_item_retry = true`.
+    Retry,
+}
+
+impl Record {
+    /// `s` with this record (the in-memory copy of what [`Paths::record`] writes).
+    pub fn apply(self, s: &Settings) -> Settings {
+        match self {
+            Record::Settled => Settings { login_item_offered: true, login_item_retry: false, ..*s },
+            Record::Retry => Settings { login_item_retry: true, ..*s },
+        }
+    }
+
+    /// The line edits: (key, `Some(value)`: set or append, `None`: remove).
+    fn edits(self) -> &'static [(&'static str, Option<&'static str>)] {
+        match self {
+            Record::Settled => &[("login_item_offered", Some("true")), ("login_item_retry", None)],
+            Record::Retry => &[("login_item_retry", Some("true"))],
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Record::Settled => "login_item_offered = true",
+            Record::Retry => "login_item_retry = true (the next launch tries again)",
+        }
+    }
+}
+
+/// `text` (a settings file, any bytes, even invalid UTF-8) with every `key = …` line replaced by
+/// `key = value` (or removed, `None`); `key = value` is appended when there is no such line.
+/// Every other byte stays as it was: comments, unknown keys, values ZTab could not parse.
+pub fn edit_conf(text: &[u8], key: &str, value: Option<&str>) -> Vec<u8> {
+    let is_key = |line: &[u8]| {
+        line.trim_ascii_start().strip_prefix(key.as_bytes()).is_some_and(|rest| rest.trim_ascii_start().first() == Some(&b'='))
+    };
+    let mut out = Vec::with_capacity(text.len() + key.len() + 16);
+    let mut found = false;
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        if is_key(line) {
+            found = true;
+            if let Some(v) = value {
+                out.extend_from_slice(format!("{key} = {v}\n").as_bytes());
+            }
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    if !found && let Some(v) = value {
+        if !out.is_empty() && !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(format!("{key} = {v}\n").as_bytes());
+    }
+    out
+}
+
+/// What [`Paths::apply_first_launch`] did with the login item.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LoginApplied {
+    /// Not touched (nothing to do, or a file was already at the agent's path).
+    #[default]
+    Untouched,
+    /// The agent was written: ZTab starts at the next login.
+    TurnedOn,
+    /// Writing the agent failed (the error, short, for the windows): start at login stays off and
+    /// the question stays open (`login_item_retry`).
+    Failed(String),
+}
+
+/// The result of [`Paths::apply_first_launch`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub login: LoginApplied,
+    /// The record meant for the settings (the in-memory copy takes it with [`Record::apply`],
+    /// even when writing it failed: that is in `errors`). None: nothing to record.
+    pub record: Option<Record>,
+    /// What was done, and what failed (for the log).
+    pub done: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+impl Paths {
+    /// The first-launch evidence for these paths (`settings`: as loaded; `prior`: see
+    /// [`PriorRun`]). A few `stat`s.
+    pub fn first_launch_evidence(&self, settings: &Settings, prior: PriorRun) -> Evidence {
+        Evidence {
+            recorded: settings.login_item_offered,
+            retry: settings.login_item_retry,
+            agent: exists(&self.agent_plist),
+            settings_file: exists(&self.settings_file),
+            settings_folder: self.settings_file.parent().is_some_and(exists),
+            prior,
+            isolated: self.isolated,
+        }
+    }
+
+    /// Write `r` into the settings file as line edits ([`edit_conf`]): the rest of the file stays
+    /// byte for byte, whatever ZTab could parse of it (a missing file is written with the
+    /// defaults). A file that cannot be read (permissions, an I/O error) is left alone and not
+    /// recorded: it cannot be rewritten without losing it. Returns whether the file changed.
+    /// Disk work: never on the main thread.
+    pub fn record(&self, r: Record) -> Result<bool, String> {
+        let file = self.settings_file.display();
+        let text = match std::fs::read(&self.settings_file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return write_atomic(&self.settings_file, serialize(&r.apply(&Settings::default())).as_bytes())
+                    .map(|()| true)
+                    .map_err(|e| format!("{file}: {e}"));
+            }
+            Err(e) => return Err(format!("cannot read {file} ({e}): {} not recorded, the file is left as it is", r.describe())),
+        };
+        let new = r.edits().iter().fold(text.clone(), |t, (k, v)| edit_conf(&t, k, *v));
+        if new == text {
+            return Ok(false);
+        }
+        write_atomic(&self.settings_file, &new).map(|()| true).map_err(|e| format!("{file}: {e}"))
+    }
+
+    /// Carry out a [`first_launch`] answer: `TurnOn` writes the login agent for `program` (unless
+    /// a file appeared at its path meanwhile: never overwrite one) and records `Settled`, or
+    /// `Retry` when the agent could not be written; `RanBefore` records `Settled`. It does not run
+    /// `launchctl`: launchd loads the agent at the next login, as when the Settings checkbox is
+    /// ticked (this ZTab runs already; loading the job now would start a second one, which would
+    /// exit at once). Disk work: never on the main thread.
+    pub fn apply_first_launch(&self, d: &FirstLaunch, program: &str) -> Applied {
+        let mut a = Applied::default();
+        let record = match d {
+            FirstLaunch::Settled | FirstLaunch::NotInstalled(_) => return a,
+            FirstLaunch::RanBefore(_) => Record::Settled,
+            FirstLaunch::TurnOn if exists(&self.agent_plist) => {
+                a.done.push(format!("a file appeared at {} meanwhile: left as it is", self.agent_plist.display()));
+                Record::Settled
+            }
+            FirstLaunch::TurnOn => match self.set_login_file(true, program) {
+                Ok(()) => {
+                    a.login = LoginApplied::TurnedOn;
+                    a.done.push(format!("wrote {} (program {program})", self.agent_plist.display()));
+                    Record::Settled
+                }
+                Err(e) => {
+                    a.errors.push(format!("could not write {}: {e}", self.agent_plist.display()));
+                    a.login = LoginApplied::Failed(e.to_string());
+                    Record::Retry
+                }
+            },
+        };
+        a.record = Some(record);
+        match self.record(record) {
+            Ok(changed) => a.done.push(format!(
+                "{} {} in {}",
+                if changed { "recorded" } else { "already recorded:" },
+                record.describe(),
+                self.settings_file.display()
+            )),
+            Err(e) => a.errors.push(e),
+        }
+        a
+    }
+}
+
 /// `ztab --set-login on|off` / `--login-status` (command line, before any GUI): change the
 /// login agent file and, outside the isolated mode, the launchd job: `on` boots the new
 /// definition in (RunAtLoad starts ZTab now, like a login would; a second ZTab exits at once),
-/// `off` boots it out (which stops a ZTab that launchd started). Returns the line to print.
+/// `off` boots it out (which stops a ZTab that launchd started). Either records the choice in the
+/// settings ([`Record::Settled`], a line edit), so ZTab's first launch does not decide again (an
+/// installer that leaves the login item off runs `--set-login off`). Returns the line to print.
 pub fn cli_set_login(paths: &Paths, on: bool, program: &str) -> Result<String, String> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let launchctl = |args: &[&str]| -> Result<(), String> {
@@ -407,6 +757,13 @@ pub fn cli_set_login(paths: &Paths, on: bool, program: &str) -> Result<String, S
         let _ = launchctl(&["bootout", &format!("{domain}/{AGENT_LABEL}")]);
     }
     paths.set_login_file(on, program).map_err(|e| format!("{}: {e}", paths.agent_plist.display()))?;
+    // The choice is made: record it as a line edit (the rest of the settings file stays as it
+    // is). A failure only costs the record; the evidence rule of `first_launch` still sees the
+    // settings file, or the agent and the log this command writes.
+    let record = match paths.record(Record::Settled) {
+        Ok(_) => String::new(),
+        Err(e) => format!("; could not record the choice: {e}"),
+    };
     if on && !paths.isolated {
         launchctl(&["bootstrap", &domain, &agent]).map_err(|e| {
             format!(
@@ -417,7 +774,7 @@ pub fn cli_set_login(paths: &Paths, on: bool, program: &str) -> Result<String, S
         })?;
     }
     Ok(format!(
-        "start at login: {} ({}{})",
+        "start at login: {} ({}{}){record}",
         paths.login_state(program).describe(),
         paths.agent_plist.display(),
         if paths.isolated { ", isolated: launchctl not used" } else { "" }
@@ -478,9 +835,7 @@ impl Writer {
 /// directory, held until the process exits). `false`: another ZTab holds it. Independent of the
 /// settings location: two ZTabs must never run at once, whatever settings they use.
 pub fn take_instance_lock() -> bool {
-    let dir = user_temp_dir();
-    let path = dir.join(format!("{AGENT_LABEL}.lock"));
-    let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) else {
+    let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path()) else {
         // No lock file possible: do not refuse to start over it.
         return true;
     };
@@ -492,6 +847,11 @@ pub fn take_instance_lock() -> bool {
         std::mem::forget(f);
     }
     ok
+}
+
+/// The single-instance lock file (it stays after ZTab exits).
+pub fn lock_path() -> PathBuf {
+    user_temp_dir().join(format!("{AGENT_LABEL}.lock"))
 }
 
 pub fn user_temp_dir() -> PathBuf {
@@ -530,22 +890,35 @@ mod tests {
             hotkeys: Bindings { all: Binding { hold: Hold::Control, key: keycode::F18 }, same_app: Binding { hold: Hold::Command, key: 0x00 } },
             skip_screen_recording: true,
             screen_recording_requested: true,
+            login_item_offered: true,
+            login_item_retry: true,
         };
         assert_eq!(parse(&serialize(&s)), (s, vec![]));
         assert_eq!(parse(&serialize(&d)), (d, vec![]));
-        assert!(serialize(&s).contains("\nskip_screen_recording = true\nscreen_recording_requested = true\n"));
-        // An older file without the keys: not skipped, not asked.
+        assert!(serialize(&s).contains("\nskip_screen_recording = true\nscreen_recording_requested = true\nlogin_item_offered = true\nlogin_item_retry = true\n"));
+        // The retry marker is written only while it is set.
+        assert!(serialize(&d).ends_with("\nlogin_item_offered = false\n"));
+        assert!(!serialize(&d).contains("login_item_retry"));
+        // An older file without the keys: not skipped, not asked, the login question not settled.
         let old = parse("show_delay_ms = 50\n").0;
-        assert!(!old.skip_screen_recording && !old.screen_recording_requested);
+        assert!(!old.skip_screen_recording && !old.screen_recording_requested && !old.login_item_offered);
+        assert!(parse("login_item_offered = 1\n").0.login_item_offered);
+        assert_eq!(parse("login_item_offered = yes\n").1.len(), 1);
+        assert!(parse("login_item_retry = true\n").0.login_item_retry && !old.login_item_retry);
+        assert_eq!(parse("login_item_retry = later\n").1.len(), 1);
         assert_eq!(parse("skip_screen_recording = maybe\n").1.len(), 1);
         assert_eq!(parse("screen_recording_requested = maybe\n").1, vec!["screen_recording_requested: not true or false: \"maybe\"".to_string()]);
         assert!(parse("screen_recording_requested = 1\n").0.screen_recording_requested);
         // Restore defaults keeps the choice made in the Set up window and what was asked.
         let r = s.restored();
         assert_eq!(
-            (r.show_delay_ms, r.hotkeys, r.skip_screen_recording, r.screen_recording_requested),
-            (d.show_delay_ms, d.hotkeys, true, true)
+            (r.show_delay_ms, r.hotkeys, r.skip_screen_recording, r.screen_recording_requested, r.login_item_offered, r.login_item_retry),
+            (d.show_delay_ms, d.hotkeys, true, true, true, true)
         );
+        // The records in memory.
+        let open = Settings { show_delay_ms: 7, login_item_retry: true, ..d };
+        assert_eq!(Record::Settled.apply(&open), Settings { show_delay_ms: 7, login_item_offered: true, ..d });
+        assert_eq!(Record::Retry.apply(&Settings { show_delay_ms: 7, ..d }), open);
     }
 
     #[test]
@@ -704,6 +1077,281 @@ mod tests {
         assert!(line.starts_with("start at login: broken"), "{line}");
         let line = cli_set_login(&p, false, &bin).unwrap();
         assert!(line.starts_with("start at login: off"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_records_the_choice() {
+        let dir = tmpdir("cli-record");
+        let p = Paths::isolated(&dir);
+        // Off on a fresh directory: nothing to remove, but the choice is recorded.
+        cli_set_login(&p, false, "/x/ztab").unwrap();
+        assert!(!p.login_enabled());
+        assert!(p.load().0.login_item_offered);
+        // Other settings are kept, byte for byte (a line edit), and a retry marker is cleared.
+        let text = "# mine\nshow_delay_ms = 42\nfuture_key = 7\nlogin_item_retry = true\nlogin_item_offered = false\n";
+        std::fs::write(&p.settings_file, text).unwrap();
+        cli_set_login(&p, true, "/x/ztab").unwrap();
+        assert_eq!(std::fs::read_to_string(&p.settings_file).unwrap(), "# mine\nshow_delay_ms = 42\nfuture_key = 7\nlogin_item_offered = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_conf_changes_only_its_line() {
+        let k = "login_item_offered";
+        // Appended (a newline first when the file has none at its end), replaced, removed.
+        assert_eq!(edit_conf(b"", k, Some("true")), b"login_item_offered = true\n");
+        assert_eq!(edit_conf(b"a = 1", k, Some("true")), b"a = 1\nlogin_item_offered = true\n");
+        assert_eq!(edit_conf(b"a = 1\n  login_item_offered\t=false\nb = 2\n", k, Some("true")), b"a = 1\nlogin_item_offered = true\nb = 2\n");
+        assert_eq!(edit_conf(b"a = 1\nlogin_item_offered = false", k, Some("true")), b"a = 1\nlogin_item_offered = true\n");
+        assert_eq!(edit_conf(b"login_item_offered = 1\na\nlogin_item_offered = 0\n", k, None), b"a\n");
+        assert_eq!(edit_conf(b"a = 1\n", k, None), b"a = 1\n");
+        // Comments, longer keys and other bytes are not its line.
+        let other = b"# login_item_offered = true\nlogin_item_offered_x = 1\nx = \xe9\r\n";
+        let mut want = other.to_vec();
+        want.extend_from_slice(b"login_item_offered = true\n");
+        assert_eq!(edit_conf(other, k, Some("true")), want);
+    }
+
+    #[test]
+    fn record_keeps_the_rest_of_the_file() {
+        let dir = tmpdir("record");
+        let p = Paths::isolated(&dir);
+        // The reviewer's case: a Latin-1 byte in a comment (the file is not UTF-8, so loading it
+        // gives the defaults), shortcuts, a delay and a key of a newer build. Byte for byte, plus
+        // one line.
+        let text: &[u8] = b"# caf\xe9 settings\nshow_delay_ms = 300\nhotkey_all = control+48\nfuture_key = 7\n";
+        std::fs::write(&p.settings_file, text).unwrap();
+        assert!(p.load().0 == Settings::default(), "not UTF-8: the defaults");
+        assert_eq!(p.record(Record::Settled), Ok(true));
+        let mut want = text.to_vec();
+        want.extend_from_slice(b"login_item_offered = true\n");
+        assert_eq!(std::fs::read(&p.settings_file).unwrap(), want);
+        // Already recorded: the file is not written again.
+        assert_eq!(p.record(Record::Settled), Ok(false));
+        // A retry marker is a line too, and settling removes it.
+        std::fs::write(&p.settings_file, "show_delay_ms = 300\n").unwrap();
+        assert_eq!(p.record(Record::Retry), Ok(true));
+        assert_eq!(std::fs::read_to_string(&p.settings_file).unwrap(), "show_delay_ms = 300\nlogin_item_retry = true\n");
+        assert_eq!(p.record(Record::Settled), Ok(true));
+        assert_eq!(std::fs::read_to_string(&p.settings_file).unwrap(), "show_delay_ms = 300\nlogin_item_offered = true\n");
+        // No file: the defaults with the record.
+        std::fs::remove_file(&p.settings_file).unwrap();
+        assert_eq!(p.record(Record::Retry), Ok(true));
+        assert_eq!(p.load(), (Settings { login_item_retry: true, ..Settings::default() }, vec![], true));
+        // A file that cannot be read is left alone: not recorded, not replaced.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(&p.settings_file, "show_delay_ms = 300\n").unwrap();
+        std::fs::set_permissions(&p.settings_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = p.record(Record::Settled).unwrap_err();
+        assert!(e.contains("cannot read") && e.contains("left as it is"), "{e}");
+        std::fs::set_permissions(&p.settings_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(&p.settings_file).unwrap(), "show_delay_ms = 300\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const APP: &str = "/Applications/ZTab.app/Contents/MacOS/ztab";
+
+    fn fresh() -> Evidence {
+        Evidence::default()
+    }
+
+    #[test]
+    fn first_launch_rule() {
+        use FirstLaunch::*;
+        // A fresh user: no record, no agent, no settings, no log, no lock file.
+        assert_eq!(first_launch(&fresh(), Ok(())), TurnOn);
+        // Each sign of an earlier run alone keeps the login item as it is (and is recorded).
+        let one = |f: fn(&mut Evidence)| {
+            let mut e = fresh();
+            f(&mut e);
+            first_launch(&e, Ok(()))
+        };
+        assert_eq!(one(|e| e.prior.log = true), RanBefore(vec!["the log"]));
+        assert_eq!(one(|e| e.prior.lock_file = true), RanBefore(vec!["the instance lock file"]));
+        assert_eq!(one(|e| e.settings_file = true), RanBefore(vec!["the settings file"]));
+        assert_eq!(one(|e| e.settings_folder = true), RanBefore(vec!["the settings folder"]));
+        // The login item is on already (or a file of someone else's is there): not touched.
+        assert_eq!(one(|e| e.agent = true), RanBefore(vec!["a login agent file"]));
+        // An existing user who turned it off: unticking deleted the agent and wrote no settings
+        // before this version, but the log is there.
+        let mut off_before = fresh();
+        off_before.prior.log = true;
+        off_before.settings_folder = false;
+        assert!(matches!(first_launch(&off_before, Ok(())), RanBefore(_)));
+        // Recorded (the user toggled the box, an installer chose, or a launch decided): settled,
+        // whatever else is (or is no longer) there, even with every trace deleted.
+        let mut recorded = fresh();
+        recorded.recorded = true;
+        assert_eq!(first_launch(&recorded, Ok(())), Settled);
+        assert_eq!(first_launch(&recorded, Err("x")), Settled);
+        // Not an installed copy: nothing happens, nothing is recorded.
+        assert_eq!(first_launch(&fresh(), Err("on a mounted volume (/Volumes)")), NotInstalled("on a mounted volume (/Volumes)"));
+        // Isolated: the folder is the test directory, the log and the lock file are the real
+        // user's; only the settings file and the agent inside the directory count.
+        let mut iso = Evidence { isolated: true, settings_folder: true, prior: PriorRun { log: true, lock_file: true }, ..fresh() };
+        assert_eq!(first_launch(&iso, Ok(())), TurnOn);
+        iso.settings_file = true;
+        assert_eq!(first_launch(&iso, Ok(())), RanBefore(vec!["the settings file"]));
+        iso.settings_file = false;
+        iso.agent = true;
+        assert_eq!(first_launch(&iso, Ok(())), RanBefore(vec!["a login agent file"]));
+        iso.recorded = true;
+        assert_eq!(first_launch(&iso, Ok(())), Settled);
+        // Several signs are all named.
+        let all = Evidence { agent: true, settings_file: true, settings_folder: true, prior: PriorRun { log: true, lock_file: true }, ..fresh() };
+        assert_eq!(first_launch(&all, Ok(())), RanBefore(vec!["a login agent file", "the settings file", "the settings folder", "the log", "the instance lock file"]));
+        // A retry (the last first launch could not write the agent): its own traces do not count,
+        // an agent file still does, a record still settles it, and only an installed copy retries.
+        let retry = Evidence { retry: true, settings_file: true, settings_folder: true, prior: PriorRun { log: true, lock_file: true }, ..fresh() };
+        assert_eq!(first_launch(&retry, Ok(())), TurnOn);
+        assert_eq!(first_launch(&Evidence { isolated: true, ..retry }, Ok(())), TurnOn);
+        assert_eq!(first_launch(&Evidence { agent: true, ..retry }, Ok(())), RanBefore(vec!["a login agent file"]));
+        assert_eq!(first_launch(&Evidence { recorded: true, ..retry }, Ok(())), Settled);
+        assert_eq!(first_launch(&retry, Err("x")), NotInstalled("x"));
+    }
+
+    #[test]
+    fn only_an_installed_copy_turns_it_on() {
+        let ok = |p: &str| install_placement(p, false);
+        assert_eq!(ok(APP), Ok(()));
+        assert_eq!(ok("/Users/a/Applications/ZTab.app/Contents/MacOS/ztab"), Ok(()));
+        assert_eq!(ok("/opt/homebrew/opt/ztab/ZTab.app/Contents/MacOS/ztab"), Ok(()));
+        assert_eq!(ok("/opt/homebrew/Cellar/ztab/0.2.3/ZTab.app/Contents/MacOS/ztab"), Ok(()));
+        assert_eq!(ok("/Users/a/Apps/dist-tools/ZTab.app/Contents/MacOS/ztab"), Ok(()));
+        assert_eq!(ok("/Users/a/.claude/progress/x/first-launch/ZTab.app/Contents/MacOS/ztab"), Ok(()));
+        let no = |p: &str| install_placement(p, false).unwrap_err();
+        assert!(no("/Users/a/src/ztab/target/release/ztab").contains("app bundle"));
+        assert!(no("/usr/local/bin/ztab").contains("app bundle"));
+        assert!(no("/private/var/folders/x1/abc/T/AppTranslocation/0F2A/d/ZTab.app/Contents/MacOS/ztab").contains("Translocation"));
+        assert!(no("/Volumes/ZTab/ZTab.app/Contents/MacOS/ztab").contains("/Volumes"));
+        assert!(install_placement(APP, true).unwrap_err().contains("read-only"));
+        assert!(no("/Users/a/src/ztab/target/release/bundle/osx/ZTab.app/Contents/MacOS/ztab").contains("cargo"));
+        assert!(no("/Users/a/src/ztab/target/debug/bundle/osx/ZTab.app/Contents/MacOS/ztab").contains("cargo"));
+        assert!(no("/Users/a/src/ztab/dist/ZTab.app/Contents/MacOS/ztab").contains("dist/"));
+        assert!(no("/Users/a/src/ztab/target/ZTab.app/Contents/MacOS/ztab").contains("dist/"));
+        assert!(no("/private/var/folders/x1/abc/T/ZTab.app/Contents/MacOS/ztab").contains("temporary"));
+        assert!(no("/private/tmp/ZTab.app/Contents/MacOS/ztab").contains("temporary"));
+        assert!(no("/tmp/ZTab.app/Contents/MacOS/ztab").contains("temporary"));
+        // The real file systems: the data volume (where /Applications and the home folder live)
+        // is writable, the sealed system volume is not.
+        assert!(!read_only_volume(&std::env::temp_dir().to_string_lossy()));
+        assert!(!read_only_volume("/Applications"));
+        assert!(read_only_volume("/System/Library/CoreServices"));
+        assert!(!read_only_volume("/does/not/exist"));
+    }
+
+    #[test]
+    fn first_launch_in_an_isolated_dir() {
+        let dir = tmpdir("first");
+        let p = Paths::isolated(&dir);
+        let prog = dir.join("ZTab.app/Contents/MacOS/ztab");
+        std::fs::create_dir_all(prog.parent().unwrap()).unwrap();
+        std::fs::write(&prog, b"x").unwrap();
+        let prog = prog.to_string_lossy().into_owned();
+        // The real user's traces exist (this user runs ZTab): ignored in the isolated mode.
+        let prior = PriorRun { log: true, lock_file: true };
+        let (s, _, _) = p.load();
+        let ev = p.first_launch_evidence(&s, prior);
+        assert_eq!(ev, Evidence { settings_folder: true, prior, isolated: true, ..Evidence::default() });
+        let d = first_launch(&ev, Ok(()));
+        assert_eq!(d, FirstLaunch::TurnOn);
+        let a = p.apply_first_launch(&d, &prog);
+        assert_eq!((&a.login, a.record, a.errors.len()), (&LoginApplied::TurnedOn, Some(Record::Settled), 0), "{a:?}");
+        assert!(a.done[0].starts_with("wrote") && a.done[1].starts_with("recorded"), "{a:?}");
+        assert_eq!(p.login_state(&prog), LoginState::On);
+        assert_eq!(p.login_program().as_deref(), Some(prog.as_str()));
+        let (s2, notes, existed) = p.load();
+        assert_eq!((s2, notes.len(), existed), (Settings { login_item_offered: true, ..s }, 0, true));
+        // The next launch: settled, nothing changes.
+        assert_eq!(first_launch(&p.first_launch_evidence(&s2, prior), Ok(())), FirstLaunch::Settled);
+
+        // Turned off afterwards (the box, or --set-login off): stays off at every later launch.
+        cli_set_login(&p, false, &prog).unwrap();
+        let (s3, _, _) = p.load();
+        assert_eq!(first_launch(&p.first_launch_evidence(&s3, prior), Ok(())), FirstLaunch::Settled);
+        assert_eq!(p.login_state(&prog), LoginState::Off);
+
+        // A directory with settings from an earlier version (no record) and no agent: ran before;
+        // the agent is not written, the record is, as one more line.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p.settings_file, "show_delay_ms = 80\n").unwrap();
+        let (s4, _, _) = p.load();
+        let d = first_launch(&p.first_launch_evidence(&s4, prior), Ok(()));
+        assert_eq!(d, FirstLaunch::RanBefore(vec!["the settings file"]));
+        let a = p.apply_first_launch(&d, &prog);
+        assert_eq!((&a.login, a.record, a.errors.len()), (&LoginApplied::Untouched, Some(Record::Settled), 0), "{a:?}");
+        assert!(!p.agent_plist.exists());
+        assert_eq!(std::fs::read_to_string(&p.settings_file).unwrap(), "show_delay_ms = 80\nlogin_item_offered = true\n");
+
+        // A file that appears at the agent's path between the decision and the write is kept.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let d = first_launch(&p.first_launch_evidence(&Settings::default(), prior), Ok(()));
+        assert_eq!(d, FirstLaunch::TurnOn);
+        std::fs::create_dir_all(p.agent_plist.parent().unwrap()).unwrap();
+        std::fs::write(&p.agent_plist, "not ours").unwrap();
+        let a = p.apply_first_launch(&d, &prog);
+        assert!(a.done[0].contains("left as it is") && a.login == LoginApplied::Untouched && a.record == Some(Record::Settled), "{a:?}");
+        assert_eq!(std::fs::read_to_string(&p.agent_plist).unwrap(), "not ours");
+
+        // Settled and not-installed answers change nothing.
+        std::fs::remove_dir_all(&dir).unwrap();
+        for d in [FirstLaunch::Settled, FirstLaunch::NotInstalled("x")] {
+            assert_eq!(p.apply_first_launch(&d, &prog), Applied::default());
+            assert!(!dir.exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_first_launch_is_retried() {
+        let dir = tmpdir("retry");
+        let p = Paths::isolated(&dir);
+        let prog = "/Applications/ZTab.app/Contents/MacOS/ztab";
+        let prior = PriorRun::default();
+        // The agent cannot be written: a regular file where the LaunchAgents folder should be.
+        let agents = p.agent_plist.parent().unwrap().to_path_buf();
+        std::fs::write(&agents, "not a folder").unwrap();
+        let d = first_launch(&p.first_launch_evidence(&p.load().0, prior), Ok(()));
+        assert_eq!(d, FirstLaunch::TurnOn);
+        let a = p.apply_first_launch(&d, prog);
+        let LoginApplied::Failed(e) = &a.login else { panic!("{a:?}") };
+        assert!(!e.is_empty() && !e.contains('/'), "short, for the windows: {e}");
+        assert_eq!(a.record, Some(Record::Retry));
+        assert!(a.errors.len() == 1 && a.errors[0].starts_with("could not write"), "{a:?}");
+        // Not settled: the retry marker is recorded instead, and start at login is off.
+        let (s, _, _) = p.load();
+        assert_eq!((s.login_item_offered, s.login_item_retry), (false, true));
+        assert_eq!(p.login_state(prog), LoginState::Off);
+        // The next launch tries again, although the settings file (the marker's) exists now.
+        let ev = p.first_launch_evidence(&s, prior);
+        assert!(ev.settings_file && ev.retry);
+        assert_eq!(first_launch(&ev, Ok(())), FirstLaunch::TurnOn);
+        // Still failing: still open.
+        assert_eq!(p.apply_first_launch(&FirstLaunch::TurnOn, prog).record, Some(Record::Retry));
+        assert_eq!(first_launch(&p.first_launch_evidence(&p.load().0, prior), Ok(())), FirstLaunch::TurnOn);
+        // Fixed (the folder can be created): turned on, settled, the marker gone.
+        std::fs::remove_file(&agents).unwrap();
+        let a = p.apply_first_launch(&FirstLaunch::TurnOn, prog);
+        assert_eq!((&a.login, a.record, a.errors.len()), (&LoginApplied::TurnedOn, Some(Record::Settled), 0), "{a:?}");
+        let text = std::fs::read_to_string(&p.settings_file).unwrap();
+        assert!(text.contains("\nlogin_item_offered = true\n") && !text.contains("login_item_retry"), "{text}");
+        assert_eq!(first_launch(&p.first_launch_evidence(&p.load().0, prior), Ok(())), FirstLaunch::Settled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prior_run_traces() {
+        let dir = tmpdir("prior");
+        let log = dir.join("ztab.log");
+        let lock = exists(&lock_path());
+        assert_eq!(PriorRun::capture(&log), PriorRun { log: false, lock_file: lock });
+        std::fs::write(dir.join("ztab.log.1"), b"x").unwrap();
+        assert!(PriorRun::capture(&log).log);
+        std::fs::remove_file(dir.join("ztab.log.1")).unwrap();
+        std::fs::write(&log, b"x").unwrap();
+        assert!(PriorRun::capture(&log).log);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
