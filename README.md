@@ -62,7 +62,7 @@ scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.p
 administrator's password. Double-click it, or from a terminal:
 
 ```sh
-sudo installer -pkg dist/ZTab-0.1.0.pkg -target /
+sudo installer -pkg dist/ZTab-<version>.pkg -target /
 ```
 
 Its scripts run as root and act for the user logged in at the screen, as that user: before the
