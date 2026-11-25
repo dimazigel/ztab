@@ -146,9 +146,9 @@ pub enum ModelEvent {
     AppTerminated { pid: i32 },
 }
 
-/// ZTab's own window that the switcher lists like any other (the Settings window), as the main
-/// thread knows it. ZTab is an accessory app, so the model would otherwise never see it; it is
-/// never asked about over Accessibility.
+/// One of ZTab's own windows that the switcher lists like any other (the Settings window, the Set
+/// up window), as the main thread knows it. ZTab is an accessory app, so the model would otherwise
+/// never see them; they are never asked about over Accessibility.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnWindow {
     pub wid: u32,
@@ -263,7 +263,7 @@ impl WindowModel {
         let mut mark = |what: &'static str| marks.push((what, t0.elapsed().as_secs_f64() * 1000.0));
         let cg = self.shared.cg();
         // Copy what we need from the model.
-        let (apps, known, ready, used, minimized_at, current_cur, active_pid, active_focus_known, last_scan, own_win) = {
+        let (apps, known, ready, used, minimized_at, current_cur, active_pid, active_focus_known, last_scan, own_wins) = {
             let st = self.shared.lock();
             let apps: HashMap<i32, AppMeta> = st
                 .apps
@@ -291,7 +291,7 @@ impl WindowModel {
             let active = st.active_pid;
             let afk = active.and_then(|p| st.apps.get(&p)).is_some_and(|a| a.ready && a.focus_known);
             let last_scan: HashMap<i32, Instant> = st.apps.iter().filter_map(|(p, a)| a.last_scan.map(|t| (*p, t))).collect();
-            (apps, known, ready, st.used.clone(), st.minimized_at(), st.current.map(|c| (c.wid, c.pid)), active, afk, last_scan, st.own_win.clone())
+            (apps, known, ready, st.used.clone(), st.minimized_at(), st.current.map(|c| (c.wid, c.pid)), active, afk, last_scan, st.own_wins.clone())
         };
         mark("copy");
 
@@ -407,9 +407,9 @@ impl WindowModel {
                 },
             ));
         }
-        // ZTab's own Settings window: by its window id only (never the switcher panel), in the
-        // CG list's z-order once the list has it, in front until then (it was just opened).
-        if let Some(ow) = own_win {
+        // ZTab's own windows: by their window ids only (never the switcher panel), in the CG
+        // list's z-order once the list has them, in front until then (just opened).
+        for ow in &own_wins {
             let row = cg.by_wid.get(&ow.wid).map(|&i| &cg.rows[i]);
             let (bounds, key, onscreen) = match row {
                 Some(r) => (r.bounds, r.on_rank.map_or(OFF + r.all_rank, |k| k + 1), r.on_rank.is_some()),
@@ -505,33 +505,12 @@ impl WindowModel {
         self.shared.flush(st);
     }
 
-    /// ZTab's own listed window appeared, changed (title, frame, minimized) or went away (`None`).
-    /// A window that goes away leaves the MRU history.
-    pub fn set_own_window(&self, w: Option<OwnWindow>) {
+    /// ZTab's own listed windows (open ones; title, frame, minimized) and which of them is the
+    /// key window (`key`: its id, or `None`). A window that goes away leaves the MRU history.
+    /// While ZTab is the active app, the key one is the current window (or none is current).
+    pub fn set_own_windows(&self, wins: Vec<OwnWindow>, key: Option<u32>) {
         let mut st = self.shared.lock();
-        let old = st.own_win.as_ref().map(|o| o.wid);
-        if let Some(old) = old
-            && w.as_ref().is_none_or(|n| n.wid != old)
-        {
-            st.used.remove(&old);
-            if st.current.is_some_and(|c| c.wid == old) {
-                st.current = None;
-            }
-            st.own_key = false;
-        }
-        st.own_win = w;
-        self.shared.flush(st);
-    }
-
-    /// ZTab's own window became (`true`) or stopped being the key window. While ZTab is the
-    /// active app, that makes it the current window (or leaves none current).
-    pub fn note_own_key(&self, key: bool) {
-        let mut st = self.shared.lock();
-        st.own_key = key;
-        if st.active_pid == Some(self.own_pid) {
-            let cur = st.own_focus().map(|w| (w, self.own_pid));
-            st.set_current(cur, false);
-        }
+        st.set_own_windows(wins, key, self.own_pid);
         self.shared.flush(st);
     }
 
@@ -1145,9 +1124,9 @@ struct State {
     note: Option<Note>,
     events: Vec<ModelEvent>,
     drain_scheduled: bool,
-    /// ZTab's own listed window (see [`OwnWindow`]) and whether it is the key window.
-    own_win: Option<OwnWindow>,
-    own_key: bool,
+    /// ZTab's own listed windows (see [`OwnWindow`]) and the one that is the key window.
+    own_wins: Vec<OwnWindow>,
+    own_key: Option<u32>,
 }
 
 /// Bundle id reported for ZTab's own window.
@@ -1346,9 +1325,27 @@ impl State {
         self.set_current(f.map(|w| (w, pid)), false);
     }
 
-    /// ZTab's own window, when it is the key window.
+    /// ZTab's own window that is the key window, if any.
     fn own_focus(&self) -> Option<u32> {
-        self.own_win.as_ref().filter(|_| self.own_key).map(|w| w.wid)
+        self.own_key.filter(|k| self.own_wins.iter().any(|w| w.wid == *k))
+    }
+
+    /// See [`WindowModel::set_own_windows`].
+    fn set_own_windows(&mut self, wins: Vec<OwnWindow>, key: Option<u32>, own_pid: i32) {
+        let gone: Vec<u32> = self.own_wins.iter().map(|o| o.wid).filter(|w| !wins.iter().any(|n| n.wid == *w)).collect();
+        for old in gone {
+            self.used.remove(&old);
+            if self.current.is_some_and(|c| c.wid == old) {
+                self.current = None;
+            }
+        }
+        let key_changed = self.own_key != key;
+        self.own_wins = wins;
+        self.own_key = key;
+        if key_changed && self.active_pid == Some(own_pid) {
+            let cur = self.own_focus().map(|w| (w, own_pid));
+            self.set_current(cur, false);
+        }
     }
 
     /// An app thread reports its focused window. `polled`: read from `AXFocusedWindow` rather
@@ -2674,13 +2671,13 @@ mod tests {
         let t0 = Instant::now() - Duration::from_secs(10);
         st.active_pid = Some(10);
         st.set_current_at(Some((1, 10)), false, t0);
-        st.own_win = Some(OwnWindow { wid: 99, app_name: "ZTab".into(), title: "ZTab Settings".into(), bounds: (0.0, 0.0, 500.0, 360.0), minimized: false });
+        st.own_wins = vec![OwnWindow { wid: 99, app_name: "ZTab".into(), title: "ZTab Settings".into(), bounds: (0.0, 0.0, 500.0, 360.0), minimized: false }];
         // ZTab activates while its window is not key (yet): no current window.
         st.activate(own);
         assert_eq!((st.active_pid, st.current.map(|c| c.wid)), (Some(own), None));
         assert!(st.used.contains_key(&1), "window 1 was current for 10 s");
         // Its window became key: it is the current window.
-        st.own_key = true;
+        st.own_key = Some(99);
         st.activate(own);
         assert_eq!(st.current.map(|c| (c.wid, c.pid)), Some((99, own)));
         // Another app activates: back to its focused window.
@@ -2688,7 +2685,7 @@ mod tests {
         assert_eq!(st.current.map(|c| c.wid), Some(1));
         // ZTab switched to its own window (noted) and is activated before the window reports
         // that it is key: the activation keeps it current.
-        st.own_key = false;
+        st.own_key = None;
         st.note = Some(Note { pid: own, wid: 99, at: Instant::now() });
         st.activate(own);
         assert_eq!(st.current.map(|c| c.wid), Some(99));
@@ -2705,6 +2702,37 @@ mod tests {
         let (out, cur, mru) = order_mru(wins, cur, &used, &HashMap::new());
         assert_eq!(out[cur.unwrap()].wid, 99);
         assert_eq!(out[mru[1]].wid, 1);
+    }
+
+    #[test]
+    fn two_own_windows_key_moves_between_them_and_a_closed_one_leaves_the_history() {
+        let own = std::process::id() as i32;
+        let mut st = state_with(&[(1, 10)]);
+        let ow = |wid: u32, title: &str| OwnWindow { wid, app_name: "ZTab".into(), title: title.into(), bounds: (0.0, 0.0, 600.0, 300.0), minimized: false };
+        st.active_pid = Some(own);
+        // The Settings window (98) is key, then the Set up window (99) opens and becomes key.
+        st.set_own_windows(vec![ow(98, "ZTab Settings")], Some(98), own);
+        assert_eq!(st.current.map(|c| c.wid), Some(98));
+        st.set_own_windows(vec![ow(98, "ZTab Settings"), ow(99, "Set up ZTab")], None, own);
+        assert!(st.current.is_none(), "between resign-key and become-key nothing is current");
+        st.set_own_windows(vec![ow(98, "ZTab Settings"), ow(99, "Set up ZTab")], Some(99), own);
+        assert_eq!(st.current.map(|c| c.wid), Some(99));
+        // A move (same key window) keeps it current.
+        st.set_own_windows(vec![ow(98, "ZTab Settings"), ow(99, "Set up ZTab")], Some(99), own);
+        assert_eq!(st.current.map(|c| c.wid), Some(99));
+        // The Settings window closes: it leaves the history; the Set up window stays current.
+        st.used.insert(98, 1);
+        st.set_own_windows(vec![ow(99, "Set up ZTab")], Some(99), own);
+        assert!(!st.used.contains_key(&98));
+        assert_eq!(st.current.map(|c| c.wid), Some(99));
+        // The Set up window closes while current: nothing is current.
+        st.set_own_windows(vec![], None, own);
+        assert!(st.current.is_none());
+        // Another app active: an own window's key change does not touch its current window.
+        st.active_pid = Some(10);
+        st.set_current_at(Some((1, 10)), false, Instant::now());
+        st.set_own_windows(vec![ow(99, "Set up ZTab")], Some(99), own);
+        assert_eq!(st.current.map(|c| c.wid), Some(1));
     }
 
     #[test]

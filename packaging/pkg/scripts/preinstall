@@ -1,19 +1,58 @@
 #!/bin/bash
-# Before the bundle is replaced: remember whether the user had turned the login item off, then
-# quit a running ZTab (postinstall starts it again).
-# $2 is the install target: the user's home folder (the package installs into ~/Applications).
-TARGET="${2:-$HOME}"
-MARK="$TARGET/Library/Caches/dev.ztab.pkg.keep-login-off"
-rm -f "$MARK"
-# An upgrade with no login agent: the user unticked "Start ZTab at login" (or installed without
-# it). Keep that choice; a first install (no app yet) turns the login item on.
-if [ -d "$TARGET/Applications/ZTab.app" ] && [ ! -f "$TARGET/Library/LaunchAgents/dev.ztab.app.plist" ]; then
-  mkdir -p "$TARGET/Library/Caches" && touch "$MARK"
+# Runs as root before /Applications/ZTab.app is replaced, for the user logged in at the screen (the
+# console user): remember whether they had turned the login item off, then quit their ZTab
+# (postinstall starts it again). With nobody at the screen (an install over ssh) there is nothing
+# to do. Lines printed here go to /var/log/install.log.
+if [ "$(id -u)" = 0 ]; then
+  USER_NAME=$(stat -f %Su /dev/console 2>/dev/null)
+else
+  USER_NAME=$(id -un)
+fi
+case "$USER_NAME" in
+  "" | root | loginwindow | _mbsetupuser)
+    echo "ZTab preinstall: nobody is logged in at the screen (console user '${USER_NAME}'); no per-user steps"
+    exit 0 ;;
+esac
+UID_=$(id -u "$USER_NAME") || exit 0
+# Their home folder. dscl prints a value containing a space on a line of its own, so it is read
+# as a plist; the directory cache is the fallback.
+USER_HOME=$(dscl -plist . -read "/Users/$USER_NAME" NFSHomeDirectory 2>/dev/null \
+  | plutil -extract 'dsAttrTypeStandard:NFSHomeDirectory.0' raw -o - - 2>/dev/null)
+[ -n "$USER_HOME" ] || USER_HOME=$(dscacheutil -q user -a name "$USER_NAME" 2>/dev/null | sed -n 's/^dir: //p' | head -1)
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+  echo "ZTab preinstall: no home folder found for $USER_NAME; no per-user steps"
+  exit 0
 fi
 if [ "$(id -u)" = 0 ]; then
-  UID_=$(id -u "$(stat -f %Su /dev/console)")
+  as_user() { launchctl asuser "$UID_" sudo -u "$USER_NAME" /usr/bin/env HOME="$USER_HOME" "$@"; }
 else
-  UID_=$(id -u)
+  as_user() { "$@"; }
+fi
+
+# The note for postinstall lives in the user's own temporary folder (only they can write there)
+# and is written as the user: root never touches a predictable name in a shared folder.
+TMP_=$(as_user /usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
+if [ -n "$TMP_" ] && [ -d "$TMP_" ]; then
+  MARK="${TMP_%/}/dev.ztab.pkg.keep-login-off"
+  as_user /bin/rm -f "$MARK"
+  # An upgrade on which this user had turned "Start ZTab at login" off (or installed without
+  # it): ZTab was installed (in /Applications, or their per-user copy of earlier versions), they
+  # have used it (that copy, its log or its settings folder), and they have no login agent. The
+  # shared /Applications copy alone says nothing about this user: another user may have
+  # installed it, and then this is their first install, which turns the login item on.
+  OLD="$USER_HOME/Applications/ZTab.app"
+  had_old=0
+  if [ -d "$OLD" ] && ! [ "$OLD" -ef /Applications/ZTab.app ] \
+    && [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$OLD/Contents/Info.plist" 2>/dev/null)" = dev.ztab.app ]; then
+    had_old=1
+  fi
+  if { [ -d /Applications/ZTab.app ] || [ "$had_old" = 1 ]; } \
+    && { [ "$had_old" = 1 ] || [ -e "$USER_HOME/Library/Logs/ztab.log" ] || [ -d "$USER_HOME/Library/Application Support/ZTab" ]; } \
+    && [ ! -e "$USER_HOME/Library/LaunchAgents/dev.ztab.app.plist" ]; then
+    as_user /usr/bin/touch "$MARK" && echo "ZTab preinstall: $USER_NAME had start at login off; keeping it off"
+  fi
+else
+  echo "ZTab preinstall: no temporary folder for $USER_NAME; the login item will be turned on"
 fi
 pkill -u "$UID_" -x ztab 2>/dev/null || true
 for _ in $(seq 1 50); do pgrep -u "$UID_" -x ztab >/dev/null || break; sleep 0.1; done

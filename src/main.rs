@@ -19,6 +19,8 @@ mod hotkey;
 mod model;
 mod settings;
 mod settings_window;
+mod setup;
+mod setup_window;
 mod sysstate;
 mod thumbs;
 mod ui;
@@ -52,6 +54,8 @@ use hotkey::{Binding, Hotkey, HotkeyEvent, HotkeyHandle, Mods, Which};
 use model::{ModelEvent, OwnWindow, Snapshot, WindowModel};
 use settings::{Paths, Settings, Writer};
 use settings_window::{MsgKind, SettingsEvent, SettingsWindow};
+use setup::{GrantAction, Perm, Polled, Primary};
+use setup_window::{SetupEvent, SetupWindow};
 use sysstate::{Activity, IconPrefetcher, SecureInput, StallDetector};
 use thumbs::Thumbnailer;
 use ui::{Switcher, Tile};
@@ -90,11 +94,8 @@ const STALL_SUMMARY_S: u64 = 600;
 /// Status-bar symbols: normal, and while secure input keeps ⌥Tab from reaching ZTab.
 const SYMBOL_NORMAL: &str = "rectangle.on.rectangle";
 const SYMBOL_SECURE: &str = "lock.rectangle.on.rectangle";
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGRequestScreenCaptureAccess() -> bool;
-}
+/// The status menu item that opens the Set up window.
+const SETUP_MENU_TITLE: &str = "Set Up ZTab…";
 
 // ---------------------------------------------------------------------------------------------
 // Logging (written by a logger thread; the caller only stamps the time and queues the line)
@@ -298,6 +299,43 @@ struct State {
     settings_win: RefCell<Option<Rc<SettingsWindow>>>,
     /// Start-at-login state last read from the agent file (None: not read yet).
     login_state: RefCell<Option<settings::LoginState>>,
+    /// The "Set up ZTab" window, built the first time it is shown, then kept.
+    setup_win: RefCell<Option<Rc<SetupWindow>>>,
+    /// ZTab's windows that were closed (Settings, Set up) and not shown since: never listed in
+    /// the switcher, whatever AppKit's visibility says while a close is under way (a key change
+    /// can arrive in the middle of it).
+    own_closed: Cell<[bool; 2]>,
+    setup: RefCell<SetupCtl>,
+}
+
+/// The Set up window's state (see `setup.rs`).
+#[derive(Default)]
+struct SetupCtl {
+    /// "Grant…" clicks in this run: Accessibility, Screen Recording.
+    clicks: [u32; 2],
+    /// The newest status check (off the main thread, about every second while the window is
+    /// open); when the window opens, what this process knows without asking (`setup_known`).
+    last: Option<Polled>,
+    /// A status check arrived since the window opened (`last` is from this opening).
+    checked: bool,
+    /// Screen Recording as this process saw it at launch (a later grant needs a restart).
+    screen_at_launch: bool,
+    /// Accessibility as this process saw it at launch.
+    ax_at_launch: bool,
+    /// This process comes from a setup restart made after Screen Recording was seen granted: it
+    /// does not restart itself for Screen Recording again (see `setup::should_auto_restart`).
+    restart_saw_screen: bool,
+    /// The status checks' stop flag, while they run.
+    poll_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The first check since the window opened was logged (later ones only when they differ).
+    poll_logged: bool,
+    /// The app in front before the window opened (the focus goes back to it when the window
+    /// closes and there is no window model to pick the most recent window).
+    prev_front: Option<i32>,
+    /// A restart is under way.
+    restarting: bool,
+    /// Accessibility was granted while the window was open and the tap is not live yet.
+    await_tap: bool,
 }
 
 thread_local! {
@@ -406,6 +444,9 @@ impl State {
         m.set_paused(self.paused.get().is_some(), false);
         *self.model.borrow_mut() = Some(m);
         log("window model started");
+        // ZTab's windows already open (the Set up window, when Accessibility was granted while it
+        // was open) are listed from now on.
+        self.update_own_windows();
         self.schedule_timers();
         self.poll_model_ready(Instant::now());
     }
@@ -1141,6 +1182,7 @@ impl State {
                 ));
                 self.hk_handle.set(Some(h));
                 self.refresh_menu();
+                self.setup_tap_live();
                 self.schedule_timers();
                 self.check_usable();
             }
@@ -1230,19 +1272,13 @@ impl State {
         let sc = thumbs::screen_capture_allowed();
         let hk = self.hk_handle.get().is_some();
         ax_item.setTitle(&NSString::from_str(if ax && hk {
-            "Accessibility: granted"
+            "✓ Accessibility"
         } else if ax {
-            "Accessibility: granted (restart ZTab if Option+Tab does not work)"
+            "✓ Accessibility (restart ZTab if ⌥Tab does not work)"
         } else {
-            "Grant Accessibility access…"
+            "✗ Accessibility: ⌥Tab is off"
         }));
-        ax_item.setEnabled(!ax);
-        sc_item.setTitle(&NSString::from_str(if sc {
-            "Screen Recording: granted"
-        } else {
-            "Grant Screen Recording (for thumbnails)…"
-        }));
-        sc_item.setEnabled(!sc);
+        sc_item.setTitle(&NSString::from_str(if sc { "✓ Screen Recording" } else { "✗ Screen Recording: no thumbnails" }));
         self.check_secure_input();
     }
 }
@@ -1305,9 +1341,10 @@ impl State {
         win.set_login(self.login_state.borrow().as_ref().map(|s| s.checked()));
         self.refresh_login_state();
         let t = Instant::now();
+        self.set_own_closed(OwnWin::Settings, false);
         win.show(self.mtm);
         self.icons.prefetch([std::process::id() as i32]);
-        self.update_own_window();
+        self.update_own_windows();
         log(&format!("settings window shown ({:.1} ms) wid={}", ms_since(t), win.window().windowNumber()));
         // An accessory app may be refused activation; then front the window like a switch does
         // (WindowServer request, then makeKeyAndOrderFront on this thread).
@@ -1318,7 +1355,7 @@ impl State {
             let key = win.window().isKeyWindow();
             log(&format!("settings window: app active={active} key={key}"));
             if win.window().isVisible() && !(active && key)
-                && let Some(w) = st.own_win_info()
+                && let Some(w) = st.win_info_of(win.window(), settings_window::WINDOW_TITLE)
             {
                 log("settings window: not frontmost after activate; fronting it through the focuser");
                 st.focuser.focus(w);
@@ -1326,11 +1363,41 @@ impl State {
         });
     }
 
-    /// The Settings window as a switcher entry, when it is open.
-    fn own_win_info(&self) -> Option<WinInfo> {
-        let win = self.settings_window()?;
-        let w = win.window();
-        if !win.is_visible() || w.windowNumber() <= 0 {
+    /// Whether one of ZTab's windows was closed and not shown since (see `own_closed`).
+    fn own_closed(&self, which: OwnWin) -> bool {
+        self.own_closed.get()[which as usize]
+    }
+
+    fn set_own_closed(&self, which: OwnWin, closed: bool) {
+        let mut v = self.own_closed.get();
+        v[which as usize] = closed;
+        self.own_closed.set(v);
+    }
+
+    /// ZTab's open windows (the Settings window, the Set up window) as switcher entries, each
+    /// with whether it is the key window. A window closed since it was last shown is left out
+    /// (`windowWillClose:` comes while it is still visible).
+    fn own_win_infos(&self) -> Vec<(WinInfo, bool)> {
+        let mut v = Vec::new();
+        if !self.own_closed(OwnWin::Settings)
+            && let Some(w) = self.settings_window().filter(|w| w.is_visible())
+            && let Some(i) = self.win_info_of(w.window(), settings_window::WINDOW_TITLE)
+        {
+            v.push((i, w.window().isKeyWindow()));
+        }
+        if !self.own_closed(OwnWin::Setup)
+            && let Some(w) = self.setup_window().filter(|w| w.is_visible())
+            && let Some(i) = self.win_info_of(w.window(), setup_window::WINDOW_TITLE)
+        {
+            v.push((i, w.window().isKeyWindow()));
+        }
+        v
+    }
+
+    /// One of ZTab's own windows as a window to front (no Accessibility needed: the focuser
+    /// fronts it through WindowServer and orders it in through `raise_own_window`).
+    fn win_info_of(&self, w: &objc2_app_kit::NSWindow, title: &str) -> Option<WinInfo> {
+        if w.windowNumber() <= 0 {
             return None;
         }
         let f = w.frame();
@@ -1340,7 +1407,7 @@ impl State {
             pid: std::process::id() as i32,
             app_name: "ZTab".into(),
             bundle_id: Some(settings::AGENT_LABEL.into()),
-            title: settings_window::WINDOW_TITLE.into(),
+            title: title.into(),
             bounds: (f.origin.x, primary_h - f.origin.y - f.size.height, f.size.width, f.size.height),
             minimized: w.isMiniaturized(),
             on_current_space: !w.isMiniaturized(),
@@ -1350,16 +1417,20 @@ impl State {
         })
     }
 
-    /// Tell the model about the Settings window (open / moved / minimized / closed).
-    fn update_own_window(&self) {
+    /// Tell the model about ZTab's own windows (shown / moved / minimized / key / closing), so
+    /// the switcher lists them like any other window. The key one is read from AppKit, not taken
+    /// from the event, so the two windows' key changes can arrive in any order.
+    fn update_own_windows(&self) {
         let Some(m) = self.model() else { return };
-        m.set_own_window(self.own_win_info().map(|w| OwnWindow {
-            wid: w.wid,
-            app_name: w.app_name,
-            title: w.title,
-            bounds: w.bounds,
-            minimized: w.minimized,
-        }));
+        let infos = self.own_win_infos();
+        let key = infos.iter().find(|(_, k)| *k).map(|(w, _)| w.wid);
+        m.set_own_windows(
+            infos
+                .into_iter()
+                .map(|(w, _)| OwnWindow { wid: w.wid, app_name: w.app_name, title: w.title, bounds: w.bounds, minimized: w.minimized })
+                .collect(),
+            key,
+        );
     }
 
     /// Read the login agent's state on the settings thread, then show it: the box is ticked only
@@ -1481,7 +1552,7 @@ impl State {
             }
             SettingsEvent::Restore => {
                 win.stop_recording();
-                let s = Settings::default();
+                let s = self.settings.borrow().restored();
                 self.apply_settings(s, "restore defaults");
                 win.set_values(&s);
                 win.set_message(
@@ -1493,51 +1564,78 @@ impl State {
                 if !key {
                     win.stop_recording();
                 }
-                if let Some(m) = self.model() {
-                    m.note_own_key(key);
-                }
+                self.update_own_windows();
             }
             SettingsEvent::Miniaturized(min) => {
-                self.update_own_window();
+                self.update_own_windows();
                 if min {
                     // Like closing it: ZTab would stay active with no window to type into. (The
                     // window has no minimize button; this covers a minimize from elsewhere.)
-                    self.focus_away_from_settings("minimized");
+                    self.focus_away(OwnWin::Settings, "minimized");
                 }
             }
-            SettingsEvent::Moved => self.update_own_window(),
+            SettingsEvent::Moved => self.update_own_windows(),
             SettingsEvent::Closing => {
                 win.stop_recording();
                 let wid = win.window().windowNumber();
-                if let Some(m) = self.model() {
-                    m.set_own_window(None);
-                }
+                self.set_own_closed(OwnWin::Settings, true);
+                self.update_own_windows();
                 if wid > 0 {
                     self.thumbs.forget(wid as u32);
                 }
-                self.focus_away_from_settings("closed");
+                self.focus_away(OwnWin::Settings, "closed");
             }
         }
     }
 
-    /// The Settings window is closing or was minimized (`why`) while ZTab is the active app: an
-    /// accessory app with no other window would keep the keyboard focus, so switch to the most
-    /// recently used open window on the current Space (as closing a window does in any app).
-    fn focus_away_from_settings(&self, why: &str) {
+    /// One of ZTab's windows is closing or was minimized (`why`) while ZTab is the active app: an
+    /// accessory app with no other window would keep the keyboard focus. When ZTab's other window
+    /// is open it gets the focus; otherwise switch to the most recently used open window on the
+    /// current Space (as closing a window does in any app), or, without the window model (no
+    /// Accessibility yet), activate the app that was in front before the Set up window opened.
+    fn focus_away(&self, which: OwnWin, why: &str) {
         if !NSApplication::sharedApplication(self.mtm).isActive() {
             return;
         }
-        let Some(m) = self.model() else { return };
+        let name = which.name();
+        match which {
+            OwnWin::Settings => {
+                if let Some(w) = self.setup_window().filter(|w| w.is_visible()) {
+                    log(&format!("{name} {why}: the Set up window gets the focus"));
+                    w.show(self.mtm);
+                    return;
+                }
+            }
+            OwnWin::Setup => {
+                if let Some(w) = self.settings_window().filter(|w| w.is_visible() && !w.window().isMiniaturized()) {
+                    log(&format!("{name} {why}: the Settings window gets the focus"));
+                    w.show(self.mtm);
+                    return;
+                }
+            }
+        }
+        let Some(m) = self.model() else {
+            let prev = self.setup.borrow().prev_front;
+            let app = prev.and_then(objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier);
+            match app {
+                Some(a) => {
+                    let ok = a.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty());
+                    log(&format!("{name} {why}: no window model; activating the app in front before (pid {}): {ok}", a.processIdentifier()));
+                }
+                None => log(&format!("{name} {why}: no window model and no app to give the focus to")),
+            }
+            return;
+        };
         let snap = m.snapshot();
         let own = std::process::id() as i32;
         let target = snap.mru.iter().map(|&i| &snap.windows[i]).find(|w| w.pid != own && !w.minimized && !w.hidden_app && w.on_current_space);
         match target {
             Some(w) => {
-                log(&format!("settings window {why}: focusing the most recent window wid={} app={}", w.wid, w.app_name));
+                log(&format!("{name} {why}: focusing the most recent window wid={} app={}", w.wid, w.app_name));
                 self.focuser.focus(w.clone());
                 m.note_focused(w.wid);
             }
-            None => log(&format!("settings window {why}: no window to focus")),
+            None => log(&format!("{name} {why}: no window to focus")),
         }
     }
 
@@ -1560,6 +1658,433 @@ impl State {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Set up window (permissions; see setup.rs)
+// ---------------------------------------------------------------------------------------------
+
+impl State {
+    fn setup_window(&self) -> Option<Rc<SetupWindow>> {
+        self.setup_win.borrow().clone()
+    }
+
+    /// What this process knows without asking macOS (no TCC call on the main thread): the tap or
+    /// the window model only start with Accessibility (granted at launch, or since); Screen
+    /// Recording as checked at launch.
+    fn setup_known(&self) -> Polled {
+        let ax = self.setup.borrow().ax_at_launch || self.hk_handle.get().is_some() || self.model.borrow().is_some();
+        let screen = self.setup.borrow().screen_at_launch;
+        Polled { ax, screen_here: screen, screen_child: None, ax_ms: 0.0, screen_ms: 0.0, child_ms: None }
+    }
+
+    /// Show the Set up window (`why`: for the log), building it the first time, and start the
+    /// status checks. It never asks macOS for a permission by itself: only its buttons do.
+    fn show_setup(&self, why: &str) {
+        let t = Instant::now();
+        let existing = self.setup_window();
+        let built = existing.is_none();
+        let win = existing.unwrap_or_else(|| {
+            let w = Rc::new(SetupWindow::new(
+                self.mtm,
+                Rc::new(|e| {
+                    if let Some(st) = state() {
+                        st.on_setup_event(e);
+                    }
+                }),
+            ));
+            *self.setup_win.borrow_mut() = Some(w.clone());
+            w
+        });
+        let build_ms = ms_since(t);
+        let p = if win.is_visible() {
+            let last = self.setup.borrow().last;
+            last.unwrap_or_else(|| self.setup_known())
+        } else {
+            // A new opening: what this process knows without asking (an earlier opening's checks
+            // may be minutes old) until this opening's first check arrives, milliseconds later.
+            // The main button waits for that check.
+            let me = std::process::id() as i32;
+            let p = self.setup_known();
+            let mut c = self.setup.borrow_mut();
+            c.prev_front = NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier()).filter(|&p| p != me);
+            c.last = Some(p);
+            c.checked = false;
+            drop(c);
+            win.set_primary_enabled(false);
+            p
+        };
+        self.render_setup(&win, &p);
+        let msg = if !p.ax {
+            "Start with Accessibility: click Grant…, then turn on ZTab in System Settings."
+        } else if !p.screen() {
+            "⌥Tab works. Thumbnails are optional: Grant… turns them on. Skip Thumbnails (or closing) \
+             stops this window from opening at launch."
+        } else {
+            "Everything is set up."
+        };
+        win.set_message(msg, MsgKind::Info);
+        let t2 = Instant::now();
+        self.set_own_closed(OwnWin::Setup, false);
+        win.show(self.mtm);
+        self.update_own_windows();
+        log(&format!(
+            "setup window shown ({why}): {} in {build_ms:.1} ms, shown in {:.1} ms, wid={}",
+            if built { "built" } else { "reused" },
+            ms_since(t2),
+            win.window().windowNumber()
+        ));
+        self.start_setup_poll();
+        self.front_setup_later("shown");
+    }
+
+    /// An accessory app may be refused activation (at launch nothing was clicked; after a grant
+    /// the user is in System Settings): 300 ms after `SetupWindow::show`, if ZTab is not active
+    /// with the window key, front it like a switch does (WindowServer request, then ordered in on
+    /// this thread).
+    fn front_setup_later(&self, why: &'static str) {
+        after_on_main(Duration::from_millis(300), move || {
+            let Some(st) = state() else { return };
+            let Some(win) = st.setup_window() else { return };
+            let active = NSApplication::sharedApplication(st.mtm).isActive();
+            let key = win.window().isKeyWindow();
+            log(&format!("setup window ({why}): app active={active} key={key}"));
+            if win.is_visible() && !(active && key)
+                && let Some(w) = st.win_info_of(win.window(), setup_window::WINDOW_TITLE)
+            {
+                log("setup window: not frontmost after activate; fronting it through the focuser");
+                st.focuser.focus(w);
+            }
+        });
+    }
+
+    /// A permission was just granted while the window is open: bring it back in front of System
+    /// Settings, so the result (and the next step) is seen. Only on that change, never per check.
+    fn refront_setup(&self, win: &SetupWindow, why: &'static str) {
+        if !win.is_visible() {
+            return;
+        }
+        log(&format!("setup window: {why}: bringing it to the front"));
+        win.show(self.mtm);
+        self.update_own_windows();
+        self.front_setup_later(why);
+    }
+
+    /// Show `p` in the window: the rows, the buttons' titles and the main button.
+    fn render_setup(&self, win: &SetupWindow, p: &Polled) {
+        let (clicks, at_launch) = {
+            let c = self.setup.borrow();
+            (c.clicks, c.screen_at_launch)
+        };
+        win.set_ax(p.ax, setup::grant_title(clicks[0]));
+        win.set_row(Perm::ScreenRecording, setup::screen_row(p.screen(), at_launch), setup::grant_title(clicks[1]));
+        win.set_primary(setup::primary(p.ax, p.screen()));
+    }
+
+    fn on_setup_event(&self, e: SetupEvent) {
+        let Some(win) = self.setup_window() else { return };
+        match e {
+            SetupEvent::Grant(perm) => {
+                let i = match perm {
+                    Perm::Accessibility => 0,
+                    Perm::ScreenRecording => 1,
+                };
+                let before = {
+                    let mut c = self.setup.borrow_mut();
+                    c.clicks[i] += 1;
+                    c.clicks[i] - 1
+                };
+                let name = perm.name();
+                let requested = self.settings.borrow().screen_recording_requested;
+                match setup::grant_action(perm, before, requested) {
+                    GrantAction::Request => {
+                        if perm == Perm::ScreenRecording && !requested {
+                            // macOS shows this dialog once per app: later runs open the page.
+                            let s = Settings { screen_recording_requested: true, ..*self.settings.borrow() };
+                            self.apply_settings(s, "asked macOS for Screen Recording");
+                        }
+                        // The request APIs talk to tccd and can take a while: never on this thread.
+                        log(&format!("setup: Grant {name}: asking macOS (its dialog lists ZTab and offers Open System Settings)"));
+                        let spawned = std::thread::Builder::new().name("ztab-setup-request".into()).spawn(move || {
+                            let t = Instant::now();
+                            let granted = match perm {
+                                Perm::Accessibility => setup::request_accessibility(),
+                                Perm::ScreenRecording => setup::request_screen_recording(),
+                            };
+                            log(&format!("setup: {name} request returned granted={granted} after {:.1} ms", ms_since(t)));
+                        });
+                        if let Err(e) = spawned {
+                            log(&format!("setup: could not start the request thread: {e}; opening System Settings instead"));
+                            setup::open_pane(perm);
+                        }
+                        win.set_message(
+                            &format!(
+                                "In macOS's dialog, click Open System Settings, then turn on ZTab under {name}. \
+                                 No dialog? Click Open System Settings… here."
+                            ),
+                            MsgKind::Info,
+                        );
+                    }
+                    GrantAction::OpenPane => {
+                        log(&format!("setup: Grant {name}: opening System Settings ({})", perm.pane_url()));
+                        setup::open_pane(perm);
+                        win.set_message(
+                            &format!(
+                                "System Settings › Privacy & Security › {name}: turn on ZTab. \
+                                 Not in the list? Click + and choose ZTab in Applications."
+                            ),
+                            MsgKind::Info,
+                        );
+                    }
+                }
+                let last = self.setup.borrow().last;
+                self.render_setup(&win, &last.unwrap_or_else(|| self.setup_known()));
+            }
+            SetupEvent::Restart => self.restart_for_setup("Restart ZTab clicked"),
+            SetupEvent::Key(_) | SetupEvent::Moved => self.update_own_windows(),
+            SetupEvent::Primary => {
+                let kind = win.primary();
+                log(&format!("setup window: {} clicked", kind.title()));
+                if kind == Primary::SkipThumbnails && !self.settings.borrow().skip_screen_recording {
+                    let s = Settings { skip_screen_recording: true, ..*self.settings.borrow() };
+                    self.apply_settings(s, "Skip Thumbnails (Set up window)");
+                }
+                win.close();
+            }
+            SetupEvent::Closing => {
+                self.stop_setup_poll();
+                // Closed (not through the main button) with Accessibility on and Screen Recording
+                // off, as this opening's checks saw it: the same as Skip Thumbnails, so it does
+                // not open at every launch for a permission the user did not give.
+                let (checked, restarting) = {
+                    let c = self.setup.borrow();
+                    (c.checked.then_some(c.last).flatten(), c.restarting)
+                };
+                if !restarting && setup::skip_on_close(checked.as_ref()) && !self.settings.borrow().skip_screen_recording {
+                    let s = Settings { skip_screen_recording: true, ..*self.settings.borrow() };
+                    self.apply_settings(s, "Set up window closed without Screen Recording (as Skip Thumbnails)");
+                }
+                log("setup window closed");
+                self.set_own_closed(OwnWin::Setup, true);
+                self.update_own_windows();
+                let wid = win.window().windowNumber();
+                if wid > 0 {
+                    self.thumbs.forget(wid as u32);
+                }
+                self.focus_away(OwnWin::Setup, "closed");
+            }
+        }
+    }
+
+    /// Check the permissions about every second on a `ztab-setup-poll` thread while the window
+    /// is open (see `setup::poll`); each result is handled on the main thread.
+    fn start_setup_poll(&self) {
+        if self.setup.borrow().poll_stop.is_some() {
+            return;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut c = self.setup.borrow_mut();
+            c.poll_stop = Some(stop.clone());
+            c.poll_logged = false;
+        }
+        let exe = std::env::current_exe().unwrap_or_default();
+        let spawned = std::thread::Builder::new().name("ztab-setup-poll".into()).spawn(move || {
+            let mut first = true;
+            while !stop.load(Ordering::SeqCst) {
+                let p = setup::poll(&exe, std::mem::replace(&mut first, false));
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                DispatchQueue::main().exec_async(move || {
+                    if let Some(st) = state() {
+                        st.on_setup_poll(p);
+                    }
+                });
+                for _ in 0..10 {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            log(&format!("setup: could not start the status checks: {e}"));
+            self.setup.borrow_mut().poll_stop = None;
+            if let Some(w) = self.setup_window() {
+                w.set_primary_enabled(true);
+            }
+        }
+    }
+
+    fn stop_setup_poll(&self) {
+        if let Some(stop) = self.setup.borrow_mut().poll_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A status check: show it; Accessibility granted starts the tap and the window model now;
+    /// Screen Recording granted after launch restarts ZTab (once).
+    fn on_setup_poll(&self, p: Polled) {
+        if self.setup.borrow().poll_stop.is_none() {
+            return; // the window closed meanwhile
+        }
+        let (prev, logged) = {
+            let mut c = self.setup.borrow_mut();
+            c.checked = true;
+            (c.last.replace(p), std::mem::replace(&mut c.poll_logged, true))
+        };
+        if !logged || prev.is_none_or(|q| !q.same_state(&p)) {
+            log(&format!(
+                "setup: accessibility={} screen_recording={} (this process {}, helper process {}); checked off the main thread in {:.1} / {:.1} / {} ms",
+                p.ax,
+                p.screen(),
+                p.screen_here,
+                p.screen_child.map(|b| b.to_string()).unwrap_or_else(|| "not asked".into()),
+                p.ax_ms,
+                p.screen_ms,
+                p.child_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())
+            ));
+        }
+        let Some(win) = self.setup_window() else { return };
+        self.render_setup(&win, &p);
+        win.set_primary_enabled(true);
+        let ax_flipped = p.ax && prev.is_some_and(|q| !q.ax);
+        if p.ax && (ax_flipped || self.hk_handle.get().is_none() || self.model.borrow().is_none()) {
+            if ax_flipped {
+                log("setup: Accessibility granted: starting the tap and the window model");
+                self.setup.borrow_mut().await_tap = self.hk_handle.get().is_none();
+                // "⌥Tab works" is said once the tap is live (`hotkey_installed`); if it is not
+                // after a few seconds, point at Restart ZTab.
+                after_on_main(Duration::from_secs(4), || {
+                    let Some(st) = state() else { return };
+                    if st.hk_handle.get().is_none()
+                        && let Some(w) = st.setup_window().filter(|w| w.is_visible())
+                    {
+                        log("setup: Accessibility is granted but the tap is not live after 4 s");
+                        w.set_message("Accessibility is on, but ⌥Tab did not start. Click Restart ZTab.", MsgKind::Warning);
+                    }
+                });
+            }
+            self.try_install_hotkey();
+            self.ensure_model(false);
+            self.refresh_menu();
+        }
+        let (at_launch, restart_saw_screen, restarting) = {
+            let c = self.setup.borrow();
+            (c.screen_at_launch, c.restart_saw_screen, c.restarting)
+        };
+        if restarting {
+            return;
+        }
+        let screen_flipped = p.screen() && !prev.is_some_and(|q| q.screen());
+        if setup::should_auto_restart(&p, at_launch, restart_saw_screen) {
+            win.set_message("Screen Recording is on: restarting ZTab so that it can use it…", MsgKind::Info);
+            self.restart_for_setup("Screen Recording was granted");
+        } else if p.screen() && !at_launch && restart_saw_screen && screen_flipped {
+            win.set_message(
+                "Screen Recording is on, but macOS has not given it to this ZTab yet. Click Restart ZTab.",
+                MsgKind::Warning,
+            );
+            self.refront_setup(&win, "Screen Recording granted");
+        } else if ax_flipped {
+            win.set_message(
+                if self.hk_handle.get().is_some() { self.ax_works_message(&p) } else { "Accessibility is on: starting ⌥Tab…" },
+                MsgKind::Info,
+            );
+            self.refront_setup(&win, "Accessibility granted");
+        }
+    }
+
+    fn ax_works_message(&self, p: &Polled) -> &'static str {
+        if p.screen() { "Accessibility is on: ⌥Tab works now." } else { "Accessibility is on: ⌥Tab works now. Thumbnails are optional." }
+    }
+
+    /// The tap went live: say so in the Set up window when it is waiting for it.
+    fn setup_tap_live(&self) {
+        if !std::mem::replace(&mut self.setup.borrow_mut().await_tap, false) {
+            return;
+        }
+        let Some(w) = self.setup_window().filter(|w| w.is_visible()) else { return };
+        let Some(p) = self.setup.borrow().last else { return };
+        w.set_message(self.ax_works_message(&p), MsgKind::Info);
+    }
+
+    /// Restart ZTab (see `setup::relaunch_plan`): the new ZTab opens the window again (marker).
+    /// Off the main thread: the marker, the plan and launchctl or the helper.
+    fn restart_for_setup(&self, why: &str) {
+        if std::mem::replace(&mut self.setup.borrow_mut().restarting, true) {
+            return;
+        }
+        if let Some(w) = self.setup_window() {
+            w.set_message("Restarting ZTab…", MsgKind::Info);
+        }
+        let mut args: Vec<String> = std::env::args().skip(1).collect();
+        // Isolated through $ZTAB_SETTINGS_DIR (the restarted ZTab does not inherit it): keep it
+        // isolated with the flag, and never through the (user's) login agent.
+        let mut xpc = std::env::var("XPC_SERVICE_NAME").ok();
+        if self.paths.isolated {
+            xpc = None;
+            if !args.iter().any(|a| a == "--settings-dir")
+                && let Some(dir) = self.paths.settings_file.parent()
+            {
+                args.push("--settings-dir".into());
+                args.push(dir.to_string_lossy().into_owned());
+            }
+        }
+        // Whether Screen Recording was seen granted: then the new ZTab does not restart itself
+        // for it again (see `setup::should_auto_restart`).
+        let screen_seen = self.setup.borrow().last.is_some_and(|p| p.screen());
+        log(&format!("setup: restarting ZTab ({why}); XPC_SERVICE_NAME={xpc:?}; screen recording seen={screen_seen}"));
+        let spawned = std::thread::Builder::new().name("ztab-restart".into()).spawn(move || {
+            let uid = unsafe { libc::getuid() };
+            let exe = std::env::current_exe().map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default();
+            if let Err(e) = setup::write_marker(&setup::marker_path(), now_secs(), screen_seen) {
+                log(&format!("setup: could not write the reopen marker: {e}"));
+            }
+            let plan = setup::relaunch_plan(xpc.as_deref(), uid, &exe, &args);
+            log(&format!("setup: restart plan {plan:?}"));
+            log_flush(Duration::from_millis(500));
+            let kickstart = matches!(plan, setup::Relaunch::Kickstart { .. });
+            match setup::spawn_relaunch(&plan) {
+                Ok(what) if kickstart => {
+                    log(&format!("setup: {what}: launchd stops this ZTab and starts it again"));
+                    log_flush(Duration::from_millis(500));
+                    std::thread::sleep(Duration::from_secs(5));
+                    log("setup: still running 5 s after launchctl kickstart; restarting it directly");
+                }
+                Ok(what) => {
+                    log(&format!("setup: {what}; exiting"));
+                    DispatchQueue::main().exec_async(|| exit_now(0));
+                    return;
+                }
+                Err(e) => log(&format!("setup: restart failed: {e}")),
+            }
+            if kickstart {
+                let plan = setup::relaunch_plan(None, uid, &exe, &args);
+                match setup::spawn_relaunch(&plan) {
+                    Ok(what) => {
+                        log(&format!("setup: {what}; exiting"));
+                        DispatchQueue::main().exec_async(|| exit_now(0));
+                        return;
+                    }
+                    Err(e) => log(&format!("setup: restart failed: {e}")),
+                }
+            }
+            DispatchQueue::main().exec_async(|| {
+                let Some(st) = state() else { return };
+                st.setup.borrow_mut().restarting = false;
+                if let Some(w) = st.setup_window() {
+                    w.set_message("ZTab could not restart itself (see ~/Library/Logs/ztab.log). Quit it and open it again.", MsgKind::Error);
+                }
+            });
+        });
+        if let Err(e) = spawned {
+            log(&format!("setup: could not start the restart thread: {e}"));
+            self.setup.borrow_mut().restarting = false;
+        }
+    }
+}
+
 /// The Settings window's warning for a login agent that would not start this ZTab.
 fn login_warning(state: &settings::LoginState) -> Option<String> {
     match state {
@@ -1572,15 +2097,32 @@ fn login_warning(state: &settings::LoginState) -> Option<String> {
     }
 }
 
-/// A switch to the Settings window was fronted (raise thread): order it in on the main thread.
+/// ZTab's own windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnWin {
+    Settings = 0,
+    Setup = 1,
+}
+
+impl OwnWin {
+    fn name(self) -> &'static str {
+        match self {
+            OwnWin::Settings => "settings window",
+            OwnWin::Setup => "setup window",
+        }
+    }
+}
+
+/// A switch to one of ZTab's own windows (the Settings window, or the Set up window when it is
+/// fronted after being shown) was fronted (raise thread): order it in on the main thread.
 fn raise_own_window(wid: u32) {
     DispatchQueue::main().exec_async(move || {
         let Some(st) = state() else { return };
-        let Some(win) = st.settings_window() else { return };
-        let w = win.window();
-        if w.windowNumber() <= 0 || w.windowNumber() as u32 != wid {
+        let settings = st.settings_window().map(|w| objc2::Message::retain(w.window()));
+        let setup = st.setup_window().map(|w| objc2::Message::retain(w.window()));
+        let Some(w) = settings.into_iter().chain(setup).find(|w| w.windowNumber() > 0 && w.windowNumber() as u32 == wid) else {
             return;
-        }
+        };
         if w.isMiniaturized() {
             w.deminiaturize(None);
         }
@@ -1636,6 +2178,7 @@ struct MenuParts {
     item: Retained<NSStatusItem>,
     menu: Retained<NSMenu>,
     _target: Retained<MenuTarget>,
+    /// Status lines (disabled items).
     ax: Retained<NSMenuItem>,
     screen: Retained<NSMenuItem>,
     secure: Retained<NSMenuItem>,
@@ -1665,16 +2208,11 @@ define_class!(
     }
 
     impl MenuTarget {
-        #[unsafe(method(openAccessibility:))]
-        fn open_accessibility(&self, _sender: Option<&AnyObject>) {
-            prompt_accessibility();
-            open_settings("Privacy_Accessibility");
-        }
-
-        #[unsafe(method(openScreenRecording:))]
-        fn open_screen_recording(&self, _sender: Option<&AnyObject>) {
-            unsafe { CGRequestScreenCaptureAccess() };
-            open_settings("Privacy_ScreenCapture");
+        #[unsafe(method(openSetup:))]
+        fn open_setup(&self, _sender: Option<&AnyObject>) {
+            if let Some(st) = state() {
+                st.show_setup("status menu");
+            }
         }
 
         #[unsafe(method(openSettings:))]
@@ -1699,21 +2237,6 @@ impl MenuTarget {
         let this = Self::alloc(mtm).set_ivars(());
         unsafe { msg_send![super(this), init] }
     }
-}
-
-fn open_settings(anchor: &str) {
-    let url = format!("x-apple.systempreferences:com.apple.preference.security?{anchor}");
-    // Spawning a process takes a few ms: keep it off the main thread.
-    let _ = std::thread::Builder::new().name("ztab-open-settings".into()).spawn(move || {
-        let _ = std::process::Command::new("open").arg(url).status();
-    });
-}
-
-fn prompt_accessibility() {
-    use objc2_core_foundation::{CFBoolean, CFDictionary, CFString};
-    let key = CFString::from_static_str("AXTrustedCheckOptionPrompt");
-    let dict = CFDictionary::from_slices(&[&*key], &[&*CFBoolean::new(true)]);
-    unsafe { objc2_application_services::AXIsProcessTrustedWithOptions(Some(dict.as_opaque())) };
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str, action: Option<Sel>, key: &str, target: &MenuTarget) -> Retained<NSMenuItem> {
@@ -1770,10 +2293,16 @@ fn build_status_item(mtm: MainThreadMarker) -> MenuParts {
     hint.setEnabled(false);
     menu.addItem(&hint);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let ax = menu_item(mtm, "Accessibility", Some(sel!(openAccessibility:)), "", &target);
+    // Permission status lines (the menu's delegate refreshes them when it opens) and the Set up
+    // window, which grants them.
+    let ax = menu_item(mtm, "Accessibility", None, "", &target);
+    ax.setEnabled(false);
     menu.addItem(&ax);
-    let screen = menu_item(mtm, "Screen Recording", Some(sel!(openScreenRecording:)), "", &target);
+    let screen = menu_item(mtm, "Screen Recording", None, "", &target);
+    screen.setEnabled(false);
     menu.addItem(&screen);
+    let setup_item = menu_item(mtm, SETUP_MENU_TITLE, Some(sel!(openSetup:)), "", &target);
+    menu.addItem(&setup_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let settings_item = menu_item(mtm, "Settings…", Some(sel!(openSettings:)), ",", &target);
     menu.addItem(&settings_item);
@@ -1888,6 +2417,9 @@ fn make_state(mtm: MainThreadMarker, paths: Paths, settings: Settings) -> Rc<Sta
         writer: Writer::new(log),
         settings_win: RefCell::new(None),
         login_state: RefCell::new(None),
+        setup_win: RefCell::new(None),
+        own_closed: Cell::new([true, true]),
+        setup: RefCell::new(SetupCtl::default()),
     });
     STATE.with(|s| {
         let _ = s.set(st.clone());
@@ -2498,6 +3030,12 @@ fn main() {
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     let args: Vec<String> = std::env::args().collect();
 
+    // Internal: the Set up window's Screen Recording check in a fresh process (exit code 0:
+    // granted). Before anything else (no log, no instance lock).
+    if args.iter().any(|a| a == "--screen-status") {
+        std::process::exit(if windows::screen_recording_granted() { 0 } else { 1 });
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--dump-windows") {
         dump_windows(args.get(i + 1).map(String::as_str).unwrap_or("/dev/stdout"));
         return;
@@ -2632,12 +3170,29 @@ fn main() {
         log(&format!("settings: {n}"));
     }
 
-    if !windows::ax_trusted() {
-        prompt_accessibility();
+    // Permissions are only checked here, never requested (no system dialog at launch): when one
+    // is missing the Set up window opens, and its buttons ask macOS (see setup.rs). It also opens
+    // for `--setup-window` and after a restart it made (marker file).
+    let reopen = setup::take_marker(&setup::marker_path(), now_secs());
+    if let Some(r) = reopen {
+        log(&format!("setup: started by a setup restart (screen recording seen granted before it: {})", r.screen_seen));
     }
-    if !screen_granted {
-        // Shows the system prompt only the first time; afterwards it's a no-op.
-        unsafe { CGRequestScreenCaptureAccess() };
+    {
+        let mut c = st.setup.borrow_mut();
+        c.screen_at_launch = screen_granted;
+        c.ax_at_launch = trusted;
+        c.restart_saw_screen = reopen.is_some_and(|r| r.screen_seen);
+    }
+    let setup_reason = setup::launch_reason(
+        trusted,
+        screen_granted,
+        st.settings.borrow().skip_screen_recording,
+        args.iter().any(|a| a == "--setup-window"),
+        reopen.is_some(),
+    );
+    if let Some(why) = setup_reason {
+        log(&format!("setup: the Set up window opens at launch: {why}"));
+        launch_step(Duration::from_millis(150), "setup window", move |st| st.show_setup(why));
     }
     st.install_workspace_observers();
     // No-ops when they were started above (Accessibility granted).

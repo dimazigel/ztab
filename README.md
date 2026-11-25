@@ -37,7 +37,8 @@ It switches between *windows*, not apps.
   Switching fronts the window through WindowServer first and talks to the app only afterwards, on
   a background thread of that app, so a busy target app delays only its own window raise, never
   the next ⌥Tab or another app's raise.
-- **Menu-bar icon** (two overlapping rectangles): shows permission status and has **Settings…** and
+- **Menu-bar icon** (two overlapping rectangles): shows permission status and has **Set Up ZTab…**
+  (the permissions window, see [First launch](#first-launch-two-permissions)), **Settings…** and
   **Quit ZTab**.
   While **secure input** is on, the icon gets a lock and the menu says that macOS is pausing ⌥Tab.
 
@@ -46,9 +47,9 @@ It switches between *windows*, not apps.
 You need the Rust toolchain (`rustup`, stable) and Xcode command line tools.
 
 ```sh
-scripts/install.sh           # build, copy to ~/Applications/ZTab.app, start it now and at login (`ztab --set-login on`, see below)
-scripts/install.sh --no-login  # same, but only launch it (the login item is left as it is)
-scripts/uninstall.sh         # stop it, remove the login item and the app (settings are kept)
+scripts/install.sh           # build, copy to /Applications/ZTab.app, start it now and at login (`ztab --set-login on`, see below)
+scripts/install.sh --no-login  # same, but only launch it (a login item that was on stays on, pointed at the new copy)
+scripts/uninstall.sh         # stop it, remove your login item, the app and the receipts (settings are kept)
 scripts/bundle.sh            # just build dist/ZTab.app
 scripts/make-icon.sh         # regenerate packaging/AppIcon.icns from scripts/make-icon.swift
 scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.pkg
@@ -57,14 +58,37 @@ scripts/make-pkg.sh          # build the installer package dist/ZTab-<version>.p
 ### Installer package
 
 `scripts/make-pkg.sh` builds `dist/ZTab-<version>.pkg` (Apple silicon, macOS 14+). It installs
-`ZTab.app` into `~/Applications` of the user who runs it, so it needs no administrator password, and
-does what `install.sh` does: it quits a running ZTab first, then turns on the login item and
-starts ZTab. On an upgrade where you had turned *Start ZTab at login* off, it stays off.
-Double-click it, or from a terminal:
+`ZTab.app` into `/Applications`, for every user of the Mac, so the installer asks for an
+administrator's password. Double-click it, or from a terminal:
 
 ```sh
-installer -pkg dist/ZTab-0.1.0.pkg -target CurrentUserHomeDirectory
+sudo installer -pkg dist/ZTab-0.1.0.pkg -target /
 ```
+
+Its scripts run as root and act for the user logged in at the screen, as that user: before the
+copy they quit that user's ZTab; afterwards they remove an old `~/Applications/ZTab.app` of theirs
+(installed by an earlier version, bundle id `dev.ztab.app`) and its receipt in the home folder, so
+there is exactly one ZTab, turn on their login item (`ztab --set-login on`, pointing at
+`/Applications/ZTab.app`) and start ZTab. On an upgrade where they had turned *Start ZTab at login*
+off, it stays off (ZTab is just started). An upgrade means: ZTab was installed, this user has used
+it (an old per-user copy, its log or its settings folder) and has no login item; another user's
+install of the shared app does not count, so a user's first install always turns it on.
+
+The login item is per user. Other users of the Mac open ZTab from Applications and tick *Start
+ZTab at login* in its Settings; opening ZTab alone runs it only until they log out. A user who
+still has a per-user `~/Applications/ZTab.app` from an earlier version keeps running that copy:
+their login item starts it, and while it runs, opening the new one does nothing (one ZTab per
+user). They quit ZTab (its menu → Quit), delete `~/Applications/ZTab.app`, open ZTab from
+Applications and tick *Start ZTab at login* in its Settings. The installer lists these copies in
+`/var/log/install.log`. When nobody is logged in at the screen (for example `sudo installer` over
+ssh), only the app is installed; the per-user steps are skipped and `/var/log/install.log` says why
+(an old `~/Applications/ZTab.app` is then left in place: the same steps apply).
+
+`scripts/install.sh` installs into `/Applications` as well, without sudo (administrators can write
+there), with the same migration of `~/Applications/ZTab.app`. It refuses, before stopping
+anything, when `/Applications/ZTab.app` was installed by the package (it then belongs to root: use
+the package, or `sudo rm -rf /Applications/ZTab.app` first), or when the user cannot write to
+`/Applications` (not an administrator: use the package).
 
 The package is not notarized, so a copy downloaded from the internet is blocked on first open:
 allow it under *System Settings → Privacy & Security → Open Anyway*. (Avoiding that needs a paid
@@ -72,17 +96,48 @@ Apple Developer ID: the app signed with *Developer ID Application* and the harde
 package signed with *Developer ID Installer* — `ZTAB_PKG_SIGN_IDENTITY` — then notarized and
 stapled.) The app inside is signed with the same
 identity as `bundle.sh` uses, so on this Mac the privacy grants carry over; on another Mac grant
-the two permissions below once. `scripts/uninstall.sh` removes a package install too
-(`pkgutil --volume ~ --forget dev.ztab.app.pkg` also drops the install receipt).
+the two permissions below once. `scripts/uninstall.sh` removes a package install too (the app
+then belongs to root, so it runs `sudo rm -rf /Applications/ZTab.app` and
+`sudo pkgutil --forget dev.ztab.app.pkg`, which ask for your password).
 
-**First launch: grant ZTab two permissions** in *System Settings → Privacy & Security*:
+### First launch: two permissions
 
 | Permission | Needed for |
 |---|---|
-| **Accessibility** | Catching ⌥Tab and focusing the chosen window. Without it nothing works. |
-| **Screen & System Audio Recording** | Window thumbnails. Without it, tiles show app icons. |
+| **Accessibility** (required) | Catching ⌥Tab and focusing the chosen window. Without it nothing works. |
+| **Screen & System Audio Recording** (optional) | Window thumbnails. Without it, tiles show app icons. |
 
-The menu-bar menu shows each permission's state and links straight to its settings page.
+ZTab never asks macOS for these by itself, so no system dialog pops up when it starts. When one is
+missing it opens one window, **Set up ZTab**, with a row per permission (✓ Granted or ✗ Not
+granted, and a **Grant…** button):
+
+1. Click **Grant…** next to Accessibility. macOS shows its own dialog; click **Open System
+   Settings** in it and turn on ZTab in the list (macOS asks for your password or Touch ID). The
+   row turns ✓ within a second and ⌥Tab works at once, without a restart.
+2. Optionally the same for Screen Recording. Once it is on, ZTab restarts itself (Screen Recording
+   only reaches a process started after the grant) and opens the window again, now with two ✓;
+   click **Done**. macOS may still show its own "Quit & Reopen" dialog when you flip the switch:
+   ZTab has restarted already, so either button is fine.
+
+Each click shows one thing: the first click on a **Grant…** button asks macOS (which adds ZTab to
+that list, switched off, and shows the dialog with *Open System Settings*); the button then reads
+**Open System Settings…** and opens that page directly (if no dialog appeared, for example because
+you answered it before). macOS shows the Screen Recording dialog only once per app, so once ZTab
+has asked (`screen_recording_requested = true` in the settings file) its **Grant…** opens the page
+directly in later runs too. (A ZTab upgraded from 0.1.0, which asked at every launch, does not know
+that yet: there the first click shows nothing and the second opens the page.) If ZTab is not in
+the list, add it with **+**. When a permission turns on, the window comes back to the front of
+System Settings with the result. **Restart ZTab** restarts it by hand; when Screen Recording is
+granted afterwards, ZTab still restarts itself for it. **Skip Thumbnails**, or closing the window
+while Accessibility is on and Screen Recording is not, stops it from opening at launch just for
+Screen Recording (`skip_screen_recording = true` in the settings file; a missing Accessibility grant
+always opens it). With Accessibility missing, **Later** and the close button close it until the
+next launch. Only **Done** answers the Return key. The window is listed by the ⌥Tab switcher like
+any other. The menu-bar menu shows both states (✓ / ✗) and **Set Up ZTab…** opens the window at
+any time.
+
+macOS also shows a notification that a background item (ZTab's login item) was added when the
+installer or `install.sh` turns on *Start ZTab at login*; that is informational.
 
 ### Code signing and why it matters
 
@@ -129,7 +184,7 @@ switcher session is open), so opening it takes a few milliseconds.
 | **Start ZTab at login** | Writes or deletes `~/Library/LaunchAgents/dev.ztab.app.plist` (see below). The checkbox is ticked when that file exists and starts this copy of ZTab. A file that starts another copy (the app was moved, or the box was ticked in a development build) or a program that no longer exists shows the box unticked, with a warning naming that program; ticking it points the file at this copy. |
 | **Switch between all windows** (default ⌥Tab) | Click the shortcut, then press the new one. |
 | **Switch between windows of the current app** (default ⌥`) | Same. |
-| **Restore defaults** | 120 ms, ⌥Tab, ⌥` (the login item is left as it is). |
+| **Restore defaults** | 120 ms, ⌥Tab, ⌥` (the login item and the Set up window's *Skip Thumbnails* are left as they are). |
 
 **Shortcuts** are a *hold* modifier plus a key: exactly one of ⌥, ⌘ or ⌃, held while the
 switcher is open (releasing it switches), and any key. ⇧ is never part of a shortcut: held as
@@ -156,8 +211,8 @@ half a second each, measured), during which ZTab would not react to ⌥Tab. (Sho
 some other way, the focus moves on as when it closes.)
 
 **Storage**: `~/Library/Application Support/ZTab/settings.conf`, a few `key = value` lines
-(`show_delay_ms = 120`, `hotkey_all = option+48`, `hotkey_same_app = option+50`; a shortcut is
-`<option|command|control>+<virtual keycode>`). Read once at launch (a fraction of a millisecond);
+(`show_delay_ms = 120`, `hotkey_all = option+48`, `hotkey_same_app = option+50`,
+`skip_screen_recording = false`; a shortcut is `<option|command|control>+<virtual keycode>`). Read once at launch (a fraction of a millisecond);
 written on a background thread (to a temporary file, then renamed). A missing file means the
 defaults; an invalid line is ignored and logged (`settings: …` in the log).
 
@@ -170,9 +225,9 @@ Settings → General → Login Items names ZTab). The checkbox only writes or de
 started). The command line also loads or unloads the job:
 
 ```sh
-~/Applications/ZTab.app/Contents/MacOS/ztab --set-login on    # write the agent, boot it into launchd (starts ZTab now)
-~/Applications/ZTab.app/Contents/MacOS/ztab --set-login off   # boot it out (stops a launchd-started ZTab), delete it
-~/Applications/ZTab.app/Contents/MacOS/ztab --login-status    # "start at login: <state> (<plist>) program <path>"
+/Applications/ZTab.app/Contents/MacOS/ztab --set-login on    # write the agent, boot it into launchd (starts ZTab now)
+/Applications/ZTab.app/Contents/MacOS/ztab --set-login off   # boot it out (stops a launchd-started ZTab), delete it
+/Applications/ZTab.app/Contents/MacOS/ztab --login-status    # "start at login: <state> (<plist>) program <path>"
 ```
 
 `--login-status` answers for the binary it is run from: `on` (exit 0) when the agent starts that
@@ -181,7 +236,7 @@ does not exist (<path>)` (exit 3). If `launchctl bootstrap` fails (for example w
 off under *Allow in the Background*), `--set-login on` says that the file was written but not
 loaded, and `install.sh` then starts ZTab directly, so a reinstall never leaves it stopped.
 
-Replacing the binary of a loaded agent (copying a new build over `~/Applications/ZTab.app`) and
+Replacing the binary of a loaded agent (copying a new build over `/Applications/ZTab.app`) and
 starting the job at once fails: launchd refuses the new binary with a launch-constraint violation
 (`OS_REASON_CODESIGNING` in `launchctl print gui/$UID/dev.ztab.app`) until Background Task
 Management has registered it again, a few seconds later. `install.sh` reloads the job
@@ -211,7 +266,9 @@ variable exported for tests cannot send the real login item into a test director
 | `src/ui.rs` | Non-activating `NSPanel` with a vibrancy background, one level above pop-up menus (the overlay level, 102). Grid of tiles: app groups never split across rows, an accent ring marks the selection, hover/click via a tracking area. The panel's content is a tree of Core Animation layers: the tint, group backgrounds, borders and selection ring are layer properties, and thumbnails, icons and one bitmap per tile label (small icon and title) are layer contents. The labels are rendered on a `ztab-labels` thread (AppKit string drawing into a bitmap, the text colour resolved for the panel's appearance, the icon's native small bitmap), queued when a session opens, both selected and not, for the screen it will show on, so the show delay absorbs them; they are cached (least recently used dropped beyond 12 MB). So the main thread rasterises nothing, the panel has no backing store to draw, and the window server composites it on the GPU. The panel is an 8-bit sRGB window and every bitmap it shows is sRGB, so Core Animation's commit hands the images over unconverted on any display; the window server matches the panel to each display. Between sessions the panel stays ordered in, transparent and click-through, so showing it sets its frame, its layers and its opacity without ordering a window in; 50 ms after a session ends it is ordered to the front of its level again (off the show path). Tile layers beyond the current session's tiles hold no images. (`drawRect:` remains for the `--snapshot` PNG and the `draw` measurement mode.) |
 | `src/settings.rs` | The settings values and their file, the isolated test location, the login agent (plist generation, `--set-login`), the `ztab-settings` writer thread and the single-instance lock. |
 | `src/settings_window.rs` | The Settings window and its shortcut recorders (AppKit, main thread); it only reports what the user did. |
-| `src/main.rs` | App lifecycle, menu-bar item, permission flow, session state machine, watchdog, background thumbnail refresh, applying settings, logging. |
+| `src/setup.rs` | First-run permissions without AppKit: when the Set up window opens, what its buttons do (the request APIs on a background thread, or the System Settings page), the status checks (off the main thread, plus a `ztab --screen-status` child process, since a process may keep its first Screen Recording answer), and the restart (`launchctl kickstart -k` for the login agent's ZTab, else a detached helper that starts the same bundle with the same arguments once this one has exited; a marker file reopens the window). |
+| `src/setup_window.rs` | The Set up ZTab window (AppKit, main thread); it only reports what the user did. |
+| `src/main.rs` | App lifecycle, menu-bar item, the Set up window's wiring, session state machine, watchdog, background thumbnail refresh, applying settings, logging. |
 
 Nothing on the main thread waits on another app: no Accessibility call, no window-list or
 screen capture call, no icon loading and no disk write (the log has its own thread). The event
@@ -254,8 +311,9 @@ Normal`.
 | What | Where / how |
 |---|---|
 | Log | `~/Library/Logs/ztab.log`, rotated to `ztab.log.1` at 1 MB (at most ~2 MB kept). Each switcher session logs `open:` (window count, the preselected window, `mru=` (MRU order), `order=` (the switcher's order, which the selection steps through), `list_ms`/`total_ms` of main-thread work, `labels_queued`: tile labels sent to the `ztab-labels` thread) and `panel shown:` (frame, open-to-show latency, `show_ms`: main-thread time of the show including Core Animation's commit, with its steps `layout= frame= content= order= commit=`, and every tile as `wid:x,y:t` with `t=1` when it had a thumbnail at show time); `panel settled:` follows when the main thread next goes idle (`busy` since the show, the longest unit of work in between, and `key_to_settled_ms`, from the key press to then, also given after the show delay); `panel hidden (hide …, slowest draw …)` gives the longest `drawRect:` of the panel while it was up (draw mode), `tile_layers` / `holding_images` (tile layer sets, and how many hold an image), the label cache (`rendered`, `cached`, `pending`), `thumbs_landed=[wid@ms,…]` the captures that arrived while it was up, and the capture counters, including `on_main_thread` (capture-pipeline steps that ran on the main thread; always 0). At launch, `launch timeline (ms after process start): …`, `hotkey installed … (tap live <ms> ms after process start …)`, `first ⌥Tab usable <ms> ms after process start` and `model ready after …` time the start. A switch logs `commit: wid=…` when it is decided, then `focus: wid=… fronted ok=… after <ms> ms` and `focus: wid=… raised after <ms> ms` from the focus threads (or `skipped` / `superseded` when a newer switch replaced it; `AX write returned after a newer switch started`, then `re-fronted` / `kept` for the late-write check). `open:` and `commit:` carry `tap_to_main_ms`, how long the event waited between the tap thread and the main thread. Focus changes the model saw are logged as `model: ...`. `panel re-fronted (kept ordered in) in <ms> ms` follows each shown session. |
-| Main-thread stalls | Two run-loop observers time every unit of main-thread work (one timer, event, notification or dispatched block, including nested loops such as an open menu), from the first turn of the run loop, and log `main thread stall: <ms> ms (run loop, <from> -> <to>)` for each one above 50 ms (`launch work on the main thread: …` instead for a unit in the run loop's first second or one that ran a deferred launch step), with its exact length and the run-loop points it ran between (for example `sources -> loop exit`: a source handler plus the Core Animation commit); a watcher thread logs `main thread still blocked: <ms> ms` while one lasts more than 1 s. The watcher waits on a kqueue timer that the main thread arms when it wakes up and deletes before it sleeps, so it wakes only for a unit that really lasts 1 s: nothing runs while the main thread sleeps or does short work. A summary (wake-ups, units of work, longest unit, watcher wake-ups) is logged every 10 minutes. `--stall-period-ms <n>` adds the older probe detector (a block posted to the main queue every n ms; its stalls are logged without the suffix), and `--stall-summary-s <s>` changes the summary interval: `open -g ~/Applications/ZTab.app --args --stall-period-ms 10 --stall-summary-s 30` (quit ZTab first). `--stall-threshold-ms <n>` changes the 50 ms threshold. `--inject-stall-ms <n>` blocks the main thread once, 3 s after launch (`--inject-stall-at-s <s>` changes when), to check the detectors and the event tap (`e2e_tapstall`). `--no-menu-warmup` skips laying the status menu out at launch (for comparison). |
+| Main-thread stalls | Two run-loop observers time every unit of main-thread work (one timer, event, notification or dispatched block, including nested loops such as an open menu), from the first turn of the run loop, and log `main thread stall: <ms> ms (run loop, <from> -> <to>)` for each one above 50 ms (`launch work on the main thread: …` instead for a unit in the run loop's first second or one that ran a deferred launch step), with its exact length and the run-loop points it ran between (for example `sources -> loop exit`: a source handler plus the Core Animation commit); a watcher thread logs `main thread still blocked: <ms> ms` while one lasts more than 1 s. The watcher waits on a kqueue timer that the main thread arms when it wakes up and deletes before it sleeps, so it wakes only for a unit that really lasts 1 s: nothing runs while the main thread sleeps or does short work. A summary (wake-ups, units of work, longest unit, watcher wake-ups) is logged every 10 minutes. `--stall-period-ms <n>` adds the older probe detector (a block posted to the main queue every n ms; its stalls are logged without the suffix), and `--stall-summary-s <s>` changes the summary interval: `open -g /Applications/ZTab.app --args --stall-period-ms 10 --stall-summary-s 30` (quit ZTab first). `--stall-threshold-ms <n>` changes the 50 ms threshold. `--inject-stall-ms <n>` blocks the main thread once, 3 s after launch (`--inject-stall-at-s <s>` changes when), to check the detectors and the event tap (`e2e_tapstall`). `--no-menu-warmup` skips laying the status menu out at launch (for comparison). |
 | Background-work pause | `--idle-pause-s <s>` changes the idle time after which background work pauses (default 120). |
+| Permissions | `--setup-window` opens the Set up window at launch even when everything is granted (tests). The log says `setup: the Set up window opens at launch: <why>`, `setup window shown (<why>): built in <ms> ms, shown in <ms> ms`, `setup: accessibility=… screen_recording=… (this process …, helper process …); checked off the main thread in <ax> / <screen> / <helper> ms` (the first check after opening, then each change), `setup: Grant <permission>: …`, `setup: <permission> request returned …` and, for a restart, `setup: restart plan …`. `ztab --screen-status` (internal) exits 0 when Screen Recording is granted. |
 | Settings | `--settings-dir <dir>` / `ZTAB_SETTINGS_DIR`: isolated settings and login agent (tests); `--set-login on\|off [--program <path>]`, `--login-status`: the login item from the command line (see [Settings](#settings)). The log says `settings: <file> (loaded\|no file: defaults): …` at startup and `settings: <why>: …` / `settings: saved …` on every change. |
 | Secure input | `secure input on (frontmost: …)` / `secure input off` lines, plus the menu item. macOS reports the frontmost app, which is not necessarily the app that enabled it. |
 | Dump the window model | `open -W -n dist/ZTab.app --args --dump-model /tmp/m.txt` (current window, MRU order, every window) |
@@ -263,13 +321,14 @@ Normal`.
 | Render the switcher to a PNG | `open -W -n dist/ZTab.app --args --snapshot /tmp/s.png` |
 | Panel benchmark | `open -W -n -g dist/ZTab.app --args --panel-bench /tmp/pb.txt [--bench-variants tree+keep+rgba8,draw] [--bench-rounds 3] [--bench-long-gap-s 30] [--bench-snapshot /tmp/p.png]` runs beside a running ZTab and posts no input: it shows a panel with every window on each display in turn and writes, per show, `show_ms` and how long the main thread stayed busy (`busy_ms`). Variants: `draw` (`drawRect:`) or `tree` (layer tree), plus `keep` (kept ordered in), `rgba8` (8-bit sRGB window), `perdisplay`, `nofill`. Variants in one run share the thumbnail images and so Core Animation's per-image conversion cache: compare variants in separate runs. `--bench-snapshot` captures the panel through ScreenCaptureKit as the window server shows it. |
 | Label colours | `ztab --label-check <out>` (posts no input; the panel stays transparent) renders two tile labels with the process in the light appearance, switches the process to the dark one, renders them again and writes the text brightness of each (`RESULT PASS` when the text is dark, then light), plus `<out>.light.png` / `<out>.dark.png`. |
-| Panel mode | `ZTAB_PANEL_MODE=<variant>` (for example `open -g --env ZTAB_PANEL_MODE=draw ~/Applications/ZTab.app`) runs ZTab with another panel mode, for measurements; the default is `tree+keep+rgba8`. The `panel warm-up:` line at launch shows the mode in use. |
+| Panel mode | `ZTAB_PANEL_MODE=<variant>` (for example `open -g --env ZTAB_PANEL_MODE=draw /Applications/ZTab.app`) runs ZTab with another panel mode, for measurements; the default is `tree+keep+rgba8`. The `panel warm-up:` line at launch shows the mode in use. |
 | End-to-end tests | Synthetic HID key and mouse events against a running ZTab. Bundle each one with `scripts/bundle.sh <bin> dist/<bin>/ZTab.app` and run it with `open -W -n -g dist/<bin>/ZTab.app --args <out.txt> …`. Needs an unlocked screen. |
 | `e2e` | Quick taps on the user's own windows (each goes to the window after the current one in the logged order, which keeps each app's windows together, so the same app's next window first; when the first tap lands in an app with another window, two more taps toggle within it, and the line says `not checked` when it did not: e2e_spaces a and c check the toggle on scratch windows), hold and navigate, Esc, and clicking a tile while holding ⌥. |
 | `e2e_more <out> <scratch-dir>` | Every display (panel on the mouse's screen, click a tile there), a minimized window, a hidden app, ⇧⌥Tab (the last window of the switcher's order, grouped by app; with the user's windows that order and the MRU order may end alike, and the line says whether they did), ⇧⌥` from a current window in a scratch layout where they end differently (three scratch Finder windows, the middle one minimized: it preselects and restores the minimized one, the last of the order, not the least recently used one; held and released only on that window, and skipped when the user has a minimized Finder window), and ⌥` (between two scratch Finder windows it opens: from the second to the first and back). It opens and closes scratch Finder windows and a TextEdit document. |
 | `e2e_spaces <out> <scratch-dir>` | A full-screen window and other windows on the desktop Space: quick taps to the same app's window and back (two TextEdit documents), and clicking another app's window (a scratch Finder window) from the full-screen one and back (MRU and switching across Spaces), a SIGSTOPped (hung) app (panel within 250 ms, no stall, and a fresh thumbnail of its window captured while it is stopped with no capture step on ZTab's main thread; only when TextEdit was not already running), same app first, with MRU from activations outside ZTab (Finder A1, Finder A2, TextEdit T, A1 again: a quick ⌥Tab goes to A2, not the more recent T, and back; holding ⌥ and stepping past Finder's windows reaches T), the thumbnail of a minimized window, the secure-input menu warning (the status menu is opened once before secure input as a control), and a switch away from a SIGSTOPped app while its raise is blocked (the next window is fronted and raised within 200 ms and is in front after the app resumes; only when TextEdit was not already running), and an app's minimized window after its open ones (a quick ⌥Tab from Finder window F1 goes to the open F3, not to F2, minimized after it was used more recently, which stays minimized). Scratch windows only. |
 | `e2e_tapstall <out>` | Against a ZTab started with `--inject-stall-ms 1500 --inject-stall-at-s <s>`: during the stall it posts ⌥ down, Tab, Esc, ⌥ up and checks with a listen-only tap that the Option changes went through at once, that Tab and Esc were swallowed, and that the tap took the Open during the stall. |
 | `e2e_settings <out> <scratch-dir> <settings-dir>` | Against a ZTab started with `--settings-dir <settings-dir>` (it refuses to run otherwise, and checks that the real settings file and login agent are unchanged): opens Settings from the menu; the window is listed, current, and switched to and from (a quick tap from it goes to the most recent open window of another app; from there it comes right after all of that app's windows); the delay slider at 0 and 300 ms (open-to-show timings); the recorder (⌥Tab while capturing opens nothing, a bare key is refused, ⌃F18 is accepted); ⌃F18 opens the switcher without F18/Esc reaching the app in front, the old ⌥Tab passes through, releasing ⌃ switches (stepping with F18, and a quick ⌃F18); Restore defaults; the login checkbox writes and removes the isolated agent (valid plist, runs the binary); closing the window gives the focus back; reopened, it cannot be minimized (its minimize button is disabled and a press leaves it in front). Scratch Finder windows only. |
+| `e2e_setup <out> <scratch-dir> [--restart] [--expect-launchd] [--expect 11\|10\|00] [--bundle-id <id>] [--settings-dir <dir>] [--dialogs <file>]` | The Set up window, read through Accessibility, never granting or revoking anything: open already (`--setup-window`, or after a restart) or opened from the menu with a scratch Finder window in front; in front with ZTab active; the rows (✓ Granted without a Grant… button, ✗ Not granted with one) and the main button match `--expect` (Accessibility, Screen Recording; default both granted); the status checks ran off the main thread; showing it took under 100 ms. `--restart` presses Restart ZTab: a new ZTab with the same arguments reopens the window (`--expect-launchd`: it is the login agent's launchd job). The main button closes it and the scratch window is in front again. `--snapshot <file>` / `--dialogs <file>`: no dialog of another process appeared in between (a first launch without the permissions). |
 | `e2e_quit <out> <ztab-pid>` | Clicks the menu-bar icon, then "Quit ZTab". |
 | `bench_switcher <out> holds\|cycles <n> [hold_ms]` | Not a test: holds ⌥Tab (Esc, no switch) n times and reports the `open:` / `panel shown:` timings ZTab logged (memory checks: `cycles 100`). |
 | `bench_churn <out> <scratch-dir> <rounds> <cycles>` | Not a test (memory checks): per round, opens two scratch Finder windows and a scratch TextEdit document, holds ⌥Tab `cycles` times (a real switch every tenth), and closes them again. |
@@ -283,6 +342,13 @@ Normal`.
   warning when they do reach the recorder. Key names in the window follow the US layout (the
   keycode is what counts). That a ⌘ shortcut stays out of macOS's ⌘Tab switcher is unit-tested
   only (the live suites post no ⌘ keys).
+- **The first-run grant flow itself** (macOS's dialogs after **Grant…**, the switch in System
+  Settings, ZTab noticing it, starting the tap and restarting for Screen Recording, and whether
+  macOS still shows its "Quit & Reopen" dialog) needs a Mac where ZTab has not been granted yet; the
+  end-to-end suite never grants or revokes anything. `e2e_setup` covers the window with both
+  permissions granted (and **Restart ZTab**), and, run against a copy with another bundle id and no
+  grants (`--bundle-id … --expect 00 --dialogs …`), that no dialog appears at launch and the window
+  shows ✗ / ✗.
 - **Login item disabled in System Settings**: General → Login Items → *Allow in the Background*
   can switch the agent off; launchd then does not start ZTab although the file exists, and the
   checkbox (which reads the file) still shows it on.

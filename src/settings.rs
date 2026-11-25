@@ -35,22 +35,46 @@ pub struct Settings {
     /// How long ⌥Tab must be held before the switcher appears (0: at once).
     pub show_delay_ms: u64,
     pub hotkeys: Bindings,
+    /// The user chose "Skip Thumbnails" in the Set up ZTab window: a missing Screen Recording
+    /// grant alone no longer opens it at launch. "Restore defaults" keeps it.
+    pub skip_screen_recording: bool,
+    /// ZTab has asked macOS for Screen Recording (`CGRequestScreenCaptureAccess`), whose dialog
+    /// shows only once per app: a later "Grant…" opens System Settings directly. "Restore
+    /// defaults" keeps it.
+    pub screen_recording_requested: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { show_delay_ms: DEFAULT_SHOW_DELAY_MS, hotkeys: Bindings::default() }
+        Settings {
+            show_delay_ms: DEFAULT_SHOW_DELAY_MS,
+            hotkeys: Bindings::default(),
+            skip_screen_recording: false,
+            screen_recording_requested: false,
+        }
     }
 }
 
 impl Settings {
     pub fn describe(&self) -> String {
         format!(
-            "show_delay_ms={} hotkey_all={} hotkey_same_app={}",
+            "show_delay_ms={} hotkey_all={} hotkey_same_app={} skip_screen_recording={} screen_recording_requested={}",
             self.show_delay_ms,
             self.hotkeys.all.label(),
-            self.hotkeys.same_app.label()
+            self.hotkeys.same_app.label(),
+            self.skip_screen_recording,
+            self.screen_recording_requested
         )
+    }
+
+    /// "Restore defaults": the default delay and shortcuts; the Set up window's choice and what
+    /// ZTab asked macOS for stay.
+    pub fn restored(&self) -> Settings {
+        Settings {
+            skip_screen_recording: self.skip_screen_recording,
+            screen_recording_requested: self.screen_recording_requested,
+            ..Settings::default()
+        }
     }
 }
 
@@ -81,6 +105,21 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
                 }
                 Err(_) => notes.push(format!("show_delay_ms: not a number: {v:?}")),
             },
+            "skip_screen_recording" | "screen_recording_requested" => {
+                let b = match v {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => {
+                        notes.push(format!("{k}: not true or false: {v:?}"));
+                        continue;
+                    }
+                };
+                if k == "skip_screen_recording" {
+                    s.skip_screen_recording = b;
+                } else {
+                    s.screen_recording_requested = b;
+                }
+            }
             "hotkey_all" | "hotkey_same_app" => match Binding::parse_conf(v) {
                 Some(b) if k == "hotkey_all" => all = Some(b),
                 Some(b) => same = Some(b),
@@ -116,10 +155,14 @@ pub fn serialize(s: &Settings) -> String {
          # Shortcuts: <hold modifier>+<virtual keycode>, hold = option | command | control.\n\
          show_delay_ms = {}\n\
          hotkey_all = {}\n\
-         hotkey_same_app = {}\n",
+         hotkey_same_app = {}\n\
+         skip_screen_recording = {}\n\
+         screen_recording_requested = {}\n",
         s.show_delay_ms,
         s.hotkeys.all.to_conf(),
-        s.hotkeys.same_app.to_conf()
+        s.hotkeys.same_app.to_conf(),
+        s.skip_screen_recording,
+        s.screen_recording_requested
     )
 }
 
@@ -434,7 +477,7 @@ pub fn take_instance_lock() -> bool {
     ok
 }
 
-fn user_temp_dir() -> PathBuf {
+pub fn user_temp_dir() -> PathBuf {
     let mut buf = vec![0u8; 1024];
     // SAFETY: buffer and length match.
     let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
@@ -468,9 +511,24 @@ mod tests {
         let s = Settings {
             show_delay_ms: 0,
             hotkeys: Bindings { all: Binding { hold: Hold::Control, key: keycode::F18 }, same_app: Binding { hold: Hold::Command, key: 0x00 } },
+            skip_screen_recording: true,
+            screen_recording_requested: true,
         };
         assert_eq!(parse(&serialize(&s)), (s, vec![]));
         assert_eq!(parse(&serialize(&d)), (d, vec![]));
+        assert!(serialize(&s).contains("\nskip_screen_recording = true\nscreen_recording_requested = true\n"));
+        // An older file without the keys: not skipped, not asked.
+        let old = parse("show_delay_ms = 50\n").0;
+        assert!(!old.skip_screen_recording && !old.screen_recording_requested);
+        assert_eq!(parse("skip_screen_recording = maybe\n").1.len(), 1);
+        assert_eq!(parse("screen_recording_requested = maybe\n").1, vec!["screen_recording_requested: not true or false: \"maybe\"".to_string()]);
+        assert!(parse("screen_recording_requested = 1\n").0.screen_recording_requested);
+        // Restore defaults keeps the choice made in the Set up window and what was asked.
+        let r = s.restored();
+        assert_eq!(
+            (r.show_delay_ms, r.hotkeys, r.skip_screen_recording, r.screen_recording_requested),
+            (d.show_delay_ms, d.hotkeys, true, true)
+        );
     }
 
     #[test]

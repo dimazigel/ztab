@@ -1,7 +1,7 @@
 //! End-to-end check against a running ZTab: posts real (synthetic HID) key/mouse events and
 //! verifies which window ends up focused. Must run with Accessibility (bundle it with
 //! `scripts/bundle.sh e2e dist/e2e/ZTab.app` and `open -W -n dist/e2e/ZTab.app --args <out>`).
-//! Requires an unlocked screen and a running ZTab (dist/ZTab.app or ~/Applications/ZTab.app).
+//! Requires an unlocked screen and a running ZTab (dist/ZTab.app or /Applications/ZTab.app).
 
 #[path = "../windows.rs"]
 #[allow(dead_code)]
